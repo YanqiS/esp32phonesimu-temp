@@ -123,6 +123,39 @@ static void sync_hfp_call_indicators(int call, int callsetup)
     esp_hf_ag_ciev_report(connected_device, ESP_HF_IND_TYPE_SIGNAL, 5);
 }
 
+static void get_hfp_call_snapshot(esp_hf_call_status_t *call, esp_hf_call_setup_status_t *callsetup)
+{
+    if (call == NULL || callsetup == NULL)
+    {
+        return;
+    }
+
+    switch (current_call_state)
+    {
+    case CALL_STATE_ACTIVE:
+        *call = ESP_HF_CALL_STATUS_CALL_IN_PROGRESS;
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_IDLE;
+        break;
+    case CALL_STATE_INCOMING:
+        *call = ESP_HF_CALL_STATUS_NO_CALLS;
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_INCOMING;
+        break;
+    case CALL_STATE_DIALING:
+        *call = ESP_HF_CALL_STATUS_CALL_IN_PROGRESS; // 兼容部分车机
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING;
+        break;
+    case CALL_STATE_ALERTING:
+        *call = ESP_HF_CALL_STATUS_CALL_IN_PROGRESS; // 兼容部分车机
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING;
+        break;
+    case CALL_STATE_IDLE:
+    default:
+        *call = ESP_HF_CALL_STATUS_NO_CALLS;
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_IDLE;
+        break;
+    }
+}
+
 static void respond_current_calls(esp_bd_addr_t remote_addr)
 {
     esp_hf_current_call_direction_t clcc_direction =
@@ -777,17 +810,22 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         break;
 
     case ESP_HF_CIND_RESPONSE_EVT:
-        ESP_LOGI(TAG, "HF请求CIND，返回空闲设备状态");
-            esp_hf_ag_cind_response(
+    {
+        esp_hf_call_status_t call = ESP_HF_CALL_STATUS_NO_CALLS;
+        esp_hf_call_setup_status_t callsetup = ESP_HF_CALL_SETUP_STATUS_IDLE;
+        get_hfp_call_snapshot(&call, &callsetup);
+        ESP_LOGI(TAG, "HF请求CIND，返回当前通话状态(call=%d, setup=%d)", call, callsetup);
+        esp_hf_ag_cind_response(
             param->cind_rep.remote_addr,
-            ESP_HF_CALL_STATUS_NO_CALLS,
-            ESP_HF_CALL_SETUP_STATUS_IDLE,
+            call,
+            callsetup,
             ESP_HF_NETWORK_STATE_AVAILABLE,
             5,
             0,
             5,
             0);
         break;
+    }
 
     case ESP_HF_COPS_RESPONSE_EVT:
         ESP_LOGI(TAG, "HF请求运营商信息");
