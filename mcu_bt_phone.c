@@ -1124,14 +1124,66 @@ static void button_task(void *arg)
 
 static void switch_monitor_task(void *arg)
 {
+    int last_left = -1;
     int last_right = -1;
+    int left_max_seen_position = 0;
     int max_seen_position = 0;
+    TickType_t left_ignore_until = 0;
     TickType_t ignore_until = 0;
 
     while (1)
     {
+        int left = read_bcd(BCD1_1, BCD1_2, BCD1_4, BCD1_8);
         int right = read_bcd(BCD2_1, BCD2_2, BCD2_4, BCD2_8);
         TickType_t now = xTaskGetTickCount();
+
+        if (left != last_left && now >= left_ignore_until)
+        {
+            ESP_LOGI(TAG, "旋钮1: %d", left);
+
+            if (left_max_seen_position == 0 && left == 0)
+            {
+                // 初始态
+            }
+            else if (left >= 1 && left <= 3)
+            {
+                if (left > left_max_seen_position)
+                {
+                    left_max_seen_position = left;
+                    ESP_LOGI(TAG, "[旋钮1] 当前最高挡位=%d", left_max_seen_position);
+                }
+            }
+            else if (left_max_seen_position >= 1 && left == 0)
+            {
+                const char *dial_number = DEFAULT_DIAL_NUMBER;
+                if (left_max_seen_position == 2)
+                {
+                    dial_number = "13501693774";
+                }
+                else if (left_max_seen_position >= 3)
+                {
+                    dial_number = "13600136000";
+                }
+
+                ESP_LOGI(TAG, "📲 [旋钮1] 触发模拟呼出: %s", dial_number);
+                handle_call_dial(dial_number);
+                left_max_seen_position = 0;
+                left_ignore_until = now + pdMS_TO_TICKS(300);
+            }
+            else
+            {
+                if (left == 0)
+                {
+                    left_max_seen_position = 0;
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "[旋钮1] 经过中间挡位%d，等待回到0触发最高挡位=%d", left, left_max_seen_position);
+                }
+            }
+
+            last_left = left;
+        }
 
         if (right != last_right && now >= ignore_until)
         {
@@ -1303,6 +1355,7 @@ void app_main(void)
     ESP_LOGI(TAG, "💡 系统就绪");
     ESP_LOGI(TAG, "💡 上电后会自动启动蓝牙，BOOT键可手动重启");
     ESP_LOGI(TAG, "💡 按CALL键 (GPIO23) 模拟来电");
+    ESP_LOGI(TAG, "💡 旋钮1: 1→0呼出13800138000, 2→0呼出13501693774, 3→0呼出13600136000");
     ESP_LOGI(TAG, "💡 旋钮2: 1→0模拟来电, 2→0接通, 3→0挂断/拒接");
     ESP_LOGI(TAG, "");
 }
