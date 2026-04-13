@@ -79,9 +79,6 @@ typedef enum {
 } call_direction_t;
 static call_direction_t current_call_direction = CALL_DIR_OUTGOING;
  
-// 外拨时 DIALING→ALERTING 的非阻塞定时器
-static TimerHandle_t dial_alerting_timer = NULL;
-
 typedef struct
 {
     const char *name;
@@ -195,24 +192,6 @@ static void respond_current_calls(esp_bd_addr_t remote_addr)
     }
 
     ESP_LOGI(TAG, "当前没有活动呼叫，CLCC返回空列表");
-}
-
-// 定时器回调：外拨1秒后从DIALING切到ALERTING
-static void dial_alerting_timer_callback(TimerHandle_t xTimer)
-{
-    if (current_call_state == CALL_STATE_DIALING && hfp_connected)
-    {
-        current_call_state = CALL_STATE_ALERTING;
-        ESP_LOGI(TAG, "📞 对方振铃中...");
-        esp_hf_ag_out_call(
-            connected_device,
-            0,
-            0,
-            ESP_HF_CALL_STATUS_NO_CALLS,
-            ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING,
-            current_phone_number,
-            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
-    }
 }
 
 static int read_bcd(gpio_num_t bit1, gpio_num_t bit2, gpio_num_t bit4, gpio_num_t bit8)
@@ -715,15 +694,8 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             hfp_connected = true;
             memcpy(connected_device, bda, 6);
             led_mode = 2; // 绿灯常亮
- 
-            if (bsir_ret != ESP_OK)
-            {
-                ESP_LOGW(TAG, "BSIR 通知失败: %s", esp_err_to_name(bsir_ret));
-            }
-            else
-            {
-                ESP_LOGI(TAG, "✓ 已通知车机支持 In-Band Ring Tone");
-            }  
+
+            ESP_LOGI(TAG, "✓ HFP SLC已建立");
         }
         else
         {
