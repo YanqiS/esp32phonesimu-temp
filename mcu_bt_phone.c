@@ -648,13 +648,13 @@ void handle_call_dial(const char *number)
     // 发送外拨应答
     esp_hf_ag_out_call(
         connected_device,
-        0,                                    // num_active=0
+        1,                                    // 兼容部分车机：外拨阶段也按“有通话实体”上报
         0,                                    // num_held=0
-        ESP_HF_CALL_STATUS_NO_CALLS,
+        ESP_HF_CALL_STATUS_CALL_IN_PROGRESS,
         ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING,    // 2
         current_phone_number,
         ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
-    sync_hfp_call_indicators(0, 2);
+    sync_hfp_call_indicators(1, 2);
 
     // 模拟对方振铃
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -664,13 +664,13 @@ void handle_call_dial(const char *number)
         ESP_LOGI(TAG, "📞 对方振铃中...");
         esp_hf_ag_out_call(
             connected_device,
+            1,
             0,
-            0,
-            ESP_HF_CALL_STATUS_NO_CALLS,
+            ESP_HF_CALL_STATUS_CALL_IN_PROGRESS,
             ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING, // 3
             current_phone_number,
             ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
-        sync_hfp_call_indicators(0, 3);
+        sync_hfp_call_indicators(1, 3);
     }
 
     ESP_LOGI(TAG, "💡 等待对端接听：板子旋钮2→0可接通，旋钮3→0可取消");
