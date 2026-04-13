@@ -125,6 +125,11 @@ static void sync_hfp_call_indicators(int call, int callsetup)
 
 static void respond_current_calls(esp_bd_addr_t remote_addr)
 {
+    esp_hf_current_call_direction_t clcc_direction =
+        (current_call_direction == CALL_DIR_INCOMING)
+            ? ESP_HF_CURRENT_CALL_DIRECTION_INCOMING
+            : ESP_HF_CURRENT_CALL_DIRECTION_OUTGOING;
+
     if (!hfp_connected)
     {
         ESP_LOGW(TAG, "SLC未建立，跳过CLCC响应");
@@ -137,7 +142,7 @@ static void respond_current_calls(esp_bd_addr_t remote_addr)
         esp_hf_ag_clcc_response(
             remote_addr,
             1,
-            ESP_HF_CURRENT_CALL_DIRECTION_OUTGOING,
+            clcc_direction,
             ESP_HF_CURRENT_CALL_STATUS_DIALING,
             ESP_HF_CURRENT_CALL_MODE_VOICE,
             ESP_HF_CURRENT_CALL_MPTY_TYPE_SINGLE,
@@ -152,7 +157,7 @@ static void respond_current_calls(esp_bd_addr_t remote_addr)
         esp_hf_ag_clcc_response(
             remote_addr,
             1,
-            ESP_HF_CURRENT_CALL_DIRECTION_OUTGOING,
+            clcc_direction,
             ESP_HF_CURRENT_CALL_STATUS_ACTIVE,
             ESP_HF_CURRENT_CALL_MODE_VOICE,
             ESP_HF_CURRENT_CALL_MPTY_TYPE_SINGLE,
@@ -637,6 +642,7 @@ void handle_call_dial(const char *number)
 
     strncpy(current_phone_number, number, sizeof(current_phone_number) - 1);
     current_call_state = CALL_STATE_DIALING;
+    current_call_direction = CALL_DIR_OUTGOING;
     led_mode = 3; // 绿灯快闪
 
     // 发送外拨应答
@@ -648,6 +654,7 @@ void handle_call_dial(const char *number)
         ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING,    // 2
         current_phone_number,
         ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+    sync_hfp_call_indicators(0, 2);
 
     // 模拟对方振铃
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -663,6 +670,7 @@ void handle_call_dial(const char *number)
             ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING, // 3
             current_phone_number,
             ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        sync_hfp_call_indicators(0, 3);
     }
 
     ESP_LOGI(TAG, "💡 等待对端接听：板子旋钮2→0可接通，旋钮3→0可取消");
