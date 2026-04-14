@@ -684,6 +684,34 @@ void handle_call_hangup(void)
     ESP_LOGI(TAG, "📵 通话已结束");
 }
 
+static void handle_outgoing_cancel(void)
+{
+    if (current_call_state != CALL_STATE_DIALING &&
+        current_call_state != CALL_STATE_ALERTING)
+    {
+        ESP_LOGW(TAG, "❌ 当前无外拨呼叫，无法取消");
+        return;
+    }
+
+    stop_dial_alerting_timer();
+    current_call_state = CALL_STATE_IDLE;
+    led_mode = 2;
+
+    esp_hf_ag_end_call(
+        connected_device,
+        0,
+        0,
+        ESP_HF_CALL_STATUS_NO_CALLS,
+        ESP_HF_CALL_SETUP_STATUS_IDLE,
+        current_phone_number,
+        ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+    sync_hfp_call_indicators(0, 0);
+    esp_hf_ag_audio_disconnect(connected_device);
+    set_current_phone_number(NULL);
+
+    ESP_LOGI(TAG, "📵 外拨已取消");
+}
+
 // 外拨电话
 void handle_call_dial(const char *number)
 {
@@ -802,6 +830,15 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         else if (current_call_state == CALL_STATE_ACTIVE)
         {
             handle_call_hangup();
+        }
+        else if (current_call_state == CALL_STATE_DIALING ||
+                 current_call_state == CALL_STATE_ALERTING)
+        {
+            handle_outgoing_cancel();
+        }
+        else
+        {
+            ESP_LOGW(TAG, "⚠️ 收到挂断命令，但当前无可处理呼叫状态=%d", current_call_state);
         }
         break;
 
@@ -1218,20 +1255,11 @@ static void switch_monitor_task(void *arg)
                 }
                 else if (current_call_state == CALL_STATE_DIALING)
                 {
-                    current_call_state = CALL_STATE_IDLE;
-                    led_mode = 2;
-                    esp_hf_ag_end_call(
-                        connected_device,
-                        0,
-                        0,
-                        ESP_HF_CALL_STATUS_NO_CALLS,
-                        ESP_HF_CALL_SETUP_STATUS_IDLE,
-                        current_phone_number,
-                        ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
-                    sync_hfp_call_indicators(0, 0);
-                    esp_hf_ag_audio_disconnect(connected_device);
-                    set_current_phone_number(NULL);
-                    ESP_LOGI(TAG, "📵 外拨已取消");
+                    handle_outgoing_cancel();
+                }
+                else if (current_call_state == CALL_STATE_ALERTING)
+                {
+                    handle_outgoing_cancel();
                 }
                 else
                 {
