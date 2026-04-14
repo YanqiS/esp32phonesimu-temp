@@ -81,7 +81,11 @@ static call_direction_t current_call_direction = CALL_DIR_OUTGOING;
  
 // 外拨时 DIALING→ALERTING 的非阻塞定时器
 static TimerHandle_t dial_alerting_timer = NULL;
+// 外拨超时自动挂断定时器（30秒）
+static TimerHandle_t outgoing_timeout_timer = NULL;
 static void dial_alerting_timer_callback(TimerHandle_t xTimer);
+static void outgoing_timeout_timer_callback(TimerHandle_t xTimer);
+static void handle_outgoing_cancel(void);
 
 static void set_current_phone_number(const char *number)
 {
@@ -100,6 +104,40 @@ static void stop_dial_alerting_timer(void)
     {
         xTimerStop(dial_alerting_timer, 0);
     }
+}
+
+static void stop_outgoing_timeout_timer(void)
+{
+    if (outgoing_timeout_timer != NULL)
+    {
+        xTimerStop(outgoing_timeout_timer, 0);
+    }
+}
+
+static bool start_outgoing_timeout_timer(void)
+{
+    if (outgoing_timeout_timer == NULL)
+    {
+        outgoing_timeout_timer = xTimerCreate(
+            "outgoing_to",
+            pdMS_TO_TICKS(30000),
+            pdFALSE,
+            NULL,
+            outgoing_timeout_timer_callback);
+        if (outgoing_timeout_timer == NULL)
+        {
+            ESP_LOGE(TAG, "创建外拨超时定时器失败");
+            return false;
+        }
+    }
+
+    xTimerStop(outgoing_timeout_timer, 0);
+    if (xTimerStart(outgoing_timeout_timer, 0) != pdPASS)
+    {
+        ESP_LOGE(TAG, "启动外拨超时定时器失败");
+        return false;
+    }
+    return true;
 }
 
 static bool start_dial_alerting_timer(void)
@@ -258,6 +296,20 @@ static void dial_alerting_timer_callback(TimerHandle_t xTimer)
             ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING,
             current_phone_number,
             ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+    }
+}
+
+static void outgoing_timeout_timer_callback(TimerHandle_t xTimer)
+{
+    if (!hfp_connected)
+    {
+        return;
+    }
+
+    if (current_call_state == CALL_STATE_DIALING || current_call_state == CALL_STATE_ALERTING)
+    {
+        ESP_LOGW(TAG, "⏱️ 外拨超过30秒未接通，自动挂断");
+        handle_outgoing_cancel();
     }
 }
 
@@ -525,6 +577,7 @@ void simulate_incoming_call(const char *phone_number)
 void handle_call_answer(void)
 {
     stop_dial_alerting_timer();
+    stop_outgoing_timeout_timer();
 
     if (current_call_state != CALL_STATE_INCOMING &&
         current_call_state != CALL_STATE_ALERTING &&
@@ -602,6 +655,7 @@ void handle_call_answer(void)
 void handle_call_reject(void)
 {
     stop_dial_alerting_timer();
+    stop_outgoing_timeout_timer();
 
     if (current_call_state != CALL_STATE_INCOMING)
     {
@@ -644,6 +698,7 @@ void handle_call_reject(void)
 void handle_call_hangup(void)
 {
     stop_dial_alerting_timer();
+    stop_outgoing_timeout_timer();
 
     if (current_call_state != CALL_STATE_ACTIVE)
     {
@@ -694,6 +749,7 @@ static void handle_outgoing_cancel(void)
     }
 
     stop_dial_alerting_timer();
+    stop_outgoing_timeout_timer();
     current_call_state = CALL_STATE_IDLE;
     led_mode = 2;
 
@@ -758,6 +814,10 @@ void handle_call_dial(const char *number)
         ESP_LOGW(TAG, "⚠️ 定时器不可用，立即切换到对方振铃");
         dial_alerting_timer_callback(NULL);
     }
+    if (!start_outgoing_timeout_timer())
+    {
+        ESP_LOGW(TAG, "⚠️ 外拨超时保护未启用");
+    }
 
     ESP_LOGI(TAG, "💡 等待对端接听：板子旋钮2→0可接通，旋钮3→0可取消");
 }
@@ -793,6 +853,7 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         else
         {
             stop_dial_alerting_timer();
+            stop_outgoing_timeout_timer();
             hfp_connected = false;
             memset(connected_device, 0, 6);
             current_call_state = CALL_STATE_IDLE;
@@ -900,9 +961,30 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         break;
 
     case ESP_HF_UNAT_RESPONSE_EVT:
-        ESP_LOGW(TAG, "收到未知AT命令: %s", param->unat_rep.unat ? param->unat_rep.unat : "(null)");
+    {
+        const char *unat = param->unat_rep.unat;
+        ESP_LOGW(TAG, "收到未知AT命令: %s", unat ? unat : "(null)");
+        if (unat != NULL &&
+            (strstr(unat, "AT+CHUP") != NULL || strstr(unat, "AT+CHLD=0") != NULL))
+        {
+            ESP_LOGW(TAG, "⚠️ 识别到未知挂断AT命令，按挂断流程兜底处理");
+            if (current_call_state == CALL_STATE_INCOMING)
+            {
+                handle_call_reject();
+            }
+            else if (current_call_state == CALL_STATE_ACTIVE)
+            {
+                handle_call_hangup();
+            }
+            else if (current_call_state == CALL_STATE_DIALING ||
+                     current_call_state == CALL_STATE_ALERTING)
+            {
+                handle_outgoing_cancel();
+            }
+        }
         esp_hf_ag_unknown_at_send(param->unat_rep.remote_addr, NULL);
         break;
+    }
 
     default:
         ESP_LOGD(TAG, "HFP未处理事件: %d", event);
@@ -1086,6 +1168,7 @@ fail:
 static void bt_deinit(void)
 {
     stop_dial_alerting_timer();
+    stop_outgoing_timeout_timer();
 
     // 关闭HFP AG
     esp_hf_ag_deinit();
@@ -1129,6 +1212,7 @@ static void bt_cleanup_partial_init(void)
     negotiated_hfp_codec = -1;
     current_call_state = CALL_STATE_IDLE;
     set_current_phone_number(NULL);
+    stop_outgoing_timeout_timer();
 }
 
 /* ===================== 按键任务 ===================== */
