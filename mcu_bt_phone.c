@@ -78,6 +78,7 @@ typedef enum {
     CALL_DIR_INCOMING,
 } call_direction_t;
 static call_direction_t current_call_direction = CALL_DIR_OUTGOING;
+static TickType_t outgoing_call_started_at = 0;
  
 // 外拨时 DIALING→ALERTING 的非阻塞定时器
 static TimerHandle_t dial_alerting_timer = NULL;
@@ -86,6 +87,28 @@ static TimerHandle_t outgoing_timeout_timer = NULL;
 static void dial_alerting_timer_callback(TimerHandle_t xTimer);
 static void outgoing_timeout_timer_callback(TimerHandle_t xTimer);
 static void handle_outgoing_cancel(void);
+
+static void mark_outgoing_call_started(void)
+{
+    outgoing_call_started_at = xTaskGetTickCount();
+}
+
+static void clear_outgoing_call_started(void)
+{
+    outgoing_call_started_at = 0;
+}
+
+static bool is_outgoing_call_timeout(void)
+{
+    if ((current_call_state != CALL_STATE_DIALING && current_call_state != CALL_STATE_ALERTING) ||
+        outgoing_call_started_at == 0)
+    {
+        return false;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    return (now - outgoing_call_started_at) >= pdMS_TO_TICKS(30000);
+}
 
 static void set_current_phone_number(const char *number)
 {
@@ -212,6 +235,12 @@ static void sync_hfp_call_indicators(int call, int callsetup)
 
 static void respond_current_calls(esp_bd_addr_t remote_addr)
 {
+    if (is_outgoing_call_timeout())
+    {
+        ESP_LOGW(TAG, "⏱️ CLCC检查到外拨超时，自动挂断");
+        handle_outgoing_cancel();
+    }
+
     if (!hfp_connected)
     {
         ESP_LOGW(TAG, "SLC未建立，跳过CLCC响应");
@@ -550,6 +579,7 @@ void simulate_incoming_call(const char *phone_number)
     // 保存电话号码
     stop_dial_alerting_timer();
     set_current_phone_number(phone_number);
+    clear_outgoing_call_started();
     current_call_state = CALL_STATE_INCOMING;
     current_call_direction = CALL_DIR_INCOMING;
 
@@ -578,6 +608,7 @@ void handle_call_answer(void)
 {
     stop_dial_alerting_timer();
     stop_outgoing_timeout_timer();
+    clear_outgoing_call_started();
 
     if (current_call_state != CALL_STATE_INCOMING &&
         current_call_state != CALL_STATE_ALERTING &&
@@ -656,6 +687,7 @@ void handle_call_reject(void)
 {
     stop_dial_alerting_timer();
     stop_outgoing_timeout_timer();
+    clear_outgoing_call_started();
 
     if (current_call_state != CALL_STATE_INCOMING)
     {
@@ -699,6 +731,7 @@ void handle_call_hangup(void)
 {
     stop_dial_alerting_timer();
     stop_outgoing_timeout_timer();
+    clear_outgoing_call_started();
 
     if (current_call_state != CALL_STATE_ACTIVE)
     {
@@ -750,6 +783,7 @@ static void handle_outgoing_cancel(void)
 
     stop_dial_alerting_timer();
     stop_outgoing_timeout_timer();
+    clear_outgoing_call_started();
     current_call_state = CALL_STATE_IDLE;
     led_mode = 2;
 
@@ -796,6 +830,7 @@ void handle_call_dial(const char *number)
     ESP_LOGI(TAG, "📞 ===============================");
 
     set_current_phone_number(number);
+    mark_outgoing_call_started();
     current_call_state = CALL_STATE_DIALING;
     led_mode = 3; // 绿灯快闪
 
@@ -826,6 +861,8 @@ void handle_call_dial(const char *number)
 
 static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
 {
+    ESP_LOGI(TAG, "HFP事件: %d", event);
+
     switch (event)
     {
     case ESP_HF_CONNECTION_STATE_EVT:
@@ -854,6 +891,7 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         {
             stop_dial_alerting_timer();
             stop_outgoing_timeout_timer();
+            clear_outgoing_call_started();
             hfp_connected = false;
             memset(connected_device, 0, 6);
             current_call_state = CALL_STATE_IDLE;
@@ -1169,6 +1207,7 @@ static void bt_deinit(void)
 {
     stop_dial_alerting_timer();
     stop_outgoing_timeout_timer();
+    clear_outgoing_call_started();
 
     // 关闭HFP AG
     esp_hf_ag_deinit();
@@ -1213,6 +1252,7 @@ static void bt_cleanup_partial_init(void)
     current_call_state = CALL_STATE_IDLE;
     set_current_phone_number(NULL);
     stop_outgoing_timeout_timer();
+    clear_outgoing_call_started();
 }
 
 /* ===================== 按键任务 ===================== */
