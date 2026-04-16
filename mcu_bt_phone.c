@@ -79,9 +79,6 @@ typedef enum {
 } call_direction_t;
 static call_direction_t current_call_direction = CALL_DIR_OUTGOING;
  
-// 外拨时 DIALING→ALERTING 的非阻塞定时器
-static TimerHandle_t dial_alerting_timer = NULL;
-
 typedef struct
 {
     const char *name;
@@ -126,8 +123,46 @@ static void sync_hfp_call_indicators(int call, int callsetup)
     esp_hf_ag_ciev_report(connected_device, ESP_HF_IND_TYPE_SIGNAL, 5);
 }
 
+static void get_hfp_call_snapshot(esp_hf_call_status_t *call, esp_hf_call_setup_status_t *callsetup)
+{
+    if (call == NULL || callsetup == NULL)
+    {
+        return;
+    }
+
+    switch (current_call_state)
+    {
+    case CALL_STATE_ACTIVE:
+        *call = ESP_HF_CALL_STATUS_CALL_IN_PROGRESS;
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_IDLE;
+        break;
+    case CALL_STATE_INCOMING:
+        *call = ESP_HF_CALL_STATUS_NO_CALLS;
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_INCOMING;
+        break;
+    case CALL_STATE_DIALING:
+        *call = ESP_HF_CALL_STATUS_CALL_IN_PROGRESS; // 兼容部分车机
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING;
+        break;
+    case CALL_STATE_ALERTING:
+        *call = ESP_HF_CALL_STATUS_CALL_IN_PROGRESS; // 兼容部分车机
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING;
+        break;
+    case CALL_STATE_IDLE:
+    default:
+        *call = ESP_HF_CALL_STATUS_NO_CALLS;
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_IDLE;
+        break;
+    }
+}
+
 static void respond_current_calls(esp_bd_addr_t remote_addr)
 {
+    esp_hf_current_call_direction_t clcc_direction =
+        (current_call_direction == CALL_DIR_INCOMING)
+            ? ESP_HF_CURRENT_CALL_DIRECTION_INCOMING
+            : ESP_HF_CURRENT_CALL_DIRECTION_OUTGOING;
+
     if (!hfp_connected)
     {
         ESP_LOGW(TAG, "SLC未建立，跳过CLCC响应");
@@ -140,7 +175,7 @@ static void respond_current_calls(esp_bd_addr_t remote_addr)
         esp_hf_ag_clcc_response(
             remote_addr,
             1,
-            ESP_HF_CURRENT_CALL_DIRECTION_OUTGOING,
+            clcc_direction,
             ESP_HF_CURRENT_CALL_STATUS_DIALING,
             ESP_HF_CURRENT_CALL_MODE_VOICE,
             ESP_HF_CURRENT_CALL_MPTY_TYPE_SINGLE,
@@ -155,7 +190,7 @@ static void respond_current_calls(esp_bd_addr_t remote_addr)
         esp_hf_ag_clcc_response(
             remote_addr,
             1,
-            ESP_HF_CURRENT_CALL_DIRECTION_OUTGOING,
+            clcc_direction,
             ESP_HF_CURRENT_CALL_STATUS_ACTIVE,
             ESP_HF_CURRENT_CALL_MODE_VOICE,
             ESP_HF_CURRENT_CALL_MPTY_TYPE_SINGLE,
@@ -195,24 +230,6 @@ static void respond_current_calls(esp_bd_addr_t remote_addr)
     }
 
     ESP_LOGI(TAG, "当前没有活动呼叫，CLCC返回空列表");
-}
-
-// 定时器回调：外拨1秒后从DIALING切到ALERTING
-static void dial_alerting_timer_callback(TimerHandle_t xTimer)
-{
-    if (current_call_state == CALL_STATE_DIALING && hfp_connected)
-    {
-        current_call_state = CALL_STATE_ALERTING;
-        ESP_LOGI(TAG, "📞 对方振铃中...");
-        esp_hf_ag_out_call(
-            connected_device,
-            0,
-            0,
-            ESP_HF_CALL_STATUS_NO_CALLS,
-            ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING,
-            current_phone_number,
-            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
-    }
 }
 
 static int read_bcd(gpio_num_t bit1, gpio_num_t bit2, gpio_num_t bit4, gpio_num_t bit8)
@@ -658,17 +675,19 @@ void handle_call_dial(const char *number)
 
     strncpy(current_phone_number, number, sizeof(current_phone_number) - 1);
     current_call_state = CALL_STATE_DIALING;
+    current_call_direction = CALL_DIR_OUTGOING;
     led_mode = 3; // 绿灯快闪
 
     // 发送外拨应答
     esp_hf_ag_out_call(
         connected_device,
-        0,                                    // num_active=0
+        1,                                    // 兼容部分车机：外拨阶段也按“有通话实体”上报
         0,                                    // num_held=0
-        ESP_HF_CALL_STATUS_NO_CALLS,
+        ESP_HF_CALL_STATUS_CALL_IN_PROGRESS,
         ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING,    // 2
         current_phone_number,
         ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+    sync_hfp_call_indicators(1, 2);
 
     // 模拟对方振铃
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -678,12 +697,13 @@ void handle_call_dial(const char *number)
         ESP_LOGI(TAG, "📞 对方振铃中...");
         esp_hf_ag_out_call(
             connected_device,
+            1,
             0,
-            0,
-            ESP_HF_CALL_STATUS_NO_CALLS,
+            ESP_HF_CALL_STATUS_CALL_IN_PROGRESS,
             ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING, // 3
             current_phone_number,
             ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        sync_hfp_call_indicators(1, 3);
     }
 
     ESP_LOGI(TAG, "💡 等待对端接听：板子旋钮2→0可接通，旋钮3→0可取消");
@@ -715,15 +735,8 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             hfp_connected = true;
             memcpy(connected_device, bda, 6);
             led_mode = 2; // 绿灯常亮
- 
-            if (bsir_ret != ESP_OK)
-            {
-                ESP_LOGW(TAG, "BSIR 通知失败: %s", esp_err_to_name(bsir_ret));
-            }
-            else
-            {
-                ESP_LOGI(TAG, "✓ 已通知车机支持 In-Band Ring Tone");
-            }  
+
+            ESP_LOGI(TAG, "✓ HFP SLC已建立");
         }
         else
         {
@@ -797,17 +810,22 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         break;
 
     case ESP_HF_CIND_RESPONSE_EVT:
-        ESP_LOGI(TAG, "HF请求CIND，返回空闲设备状态");
-            esp_hf_ag_cind_response(
+    {
+        esp_hf_call_status_t call = ESP_HF_CALL_STATUS_NO_CALLS;
+        esp_hf_call_setup_status_t callsetup = ESP_HF_CALL_SETUP_STATUS_IDLE;
+        get_hfp_call_snapshot(&call, &callsetup);
+        ESP_LOGI(TAG, "HF请求CIND，返回当前通话状态(call=%d, setup=%d)", call, callsetup);
+        esp_hf_ag_cind_response(
             param->cind_rep.remote_addr,
-            ESP_HF_CALL_STATUS_NO_CALLS,
-            ESP_HF_CALL_SETUP_STATUS_IDLE,
+            call,
+            callsetup,
             ESP_HF_NETWORK_STATE_AVAILABLE,
             5,
             0,
             5,
             0);
         break;
+    }
 
     case ESP_HF_COPS_RESPONSE_EVT:
         ESP_LOGI(TAG, "HF请求运营商信息");
@@ -1124,14 +1142,66 @@ static void button_task(void *arg)
 
 static void switch_monitor_task(void *arg)
 {
+    int last_left = -1;
     int last_right = -1;
+    int left_max_seen_position = 0;
     int max_seen_position = 0;
+    TickType_t left_ignore_until = 0;
     TickType_t ignore_until = 0;
 
     while (1)
     {
+        int left = read_bcd(BCD1_1, BCD1_2, BCD1_4, BCD1_8);
         int right = read_bcd(BCD2_1, BCD2_2, BCD2_4, BCD2_8);
         TickType_t now = xTaskGetTickCount();
+
+        if (left != last_left && now >= left_ignore_until)
+        {
+            ESP_LOGI(TAG, "旋钮1: %d", left);
+
+            if (left_max_seen_position == 0 && left == 0)
+            {
+                // 初始态
+            }
+            else if (left >= 1 && left <= 3)
+            {
+                if (left > left_max_seen_position)
+                {
+                    left_max_seen_position = left;
+                    ESP_LOGI(TAG, "[旋钮1] 当前最高挡位=%d", left_max_seen_position);
+                }
+            }
+            else if (left_max_seen_position >= 1 && left == 0)
+            {
+                const char *dial_number = DEFAULT_DIAL_NUMBER;
+                if (left_max_seen_position == 2)
+                {
+                    dial_number = "13501693774";
+                }
+                else if (left_max_seen_position >= 3)
+                {
+                    dial_number = "13600136000";
+                }
+
+                ESP_LOGI(TAG, "📲 [旋钮1] 触发模拟呼出: %s", dial_number);
+                handle_call_dial(dial_number);
+                left_max_seen_position = 0;
+                left_ignore_until = now + pdMS_TO_TICKS(300);
+            }
+            else
+            {
+                if (left == 0)
+                {
+                    left_max_seen_position = 0;
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "[旋钮1] 经过中间挡位%d，等待回到0触发最高挡位=%d", left, left_max_seen_position);
+                }
+            }
+
+            last_left = left;
+        }
 
         if (right != last_right && now >= ignore_until)
         {
@@ -1303,6 +1373,7 @@ void app_main(void)
     ESP_LOGI(TAG, "💡 系统就绪");
     ESP_LOGI(TAG, "💡 上电后会自动启动蓝牙，BOOT键可手动重启");
     ESP_LOGI(TAG, "💡 按CALL键 (GPIO23) 模拟来电");
+    ESP_LOGI(TAG, "💡 旋钮1: 1→0呼出13800138000, 2→0呼出13501693774, 3→0呼出13600136000");
     ESP_LOGI(TAG, "💡 旋钮2: 1→0模拟来电, 2→0接通, 3→0挂断/拒接");
     ESP_LOGI(TAG, "");
 }
