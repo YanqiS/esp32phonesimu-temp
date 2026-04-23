@@ -455,14 +455,16 @@ static void configure_ap_dns_from_sta(void)
     if (stop_ret != ESP_OK && stop_ret != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
         ESP_LOGW(TAG, "⚠️ 停止 AP DHCP Server 失败: %s", esp_err_to_name(stop_ret));
     }
+    esp_netif_dns_info_t offer_dns = {0};
+    offer_dns.ip.type = ESP_IPADDR_TYPE_V4;
+    offer_dns.ip.u_addr.ip4.addr = offer_dns_addr;
     esp_err_t opt_ret = esp_netif_dhcps_option(wifi_ap_netif, ESP_NETIF_OP_SET,
                                                ESP_NETIF_DOMAIN_NAME_SERVER,
-                                               &offer_dns_addr, sizeof(offer_dns_addr));
+                                               &offer_dns, sizeof(offer_dns));
     if (opt_ret != ESP_OK) {
         ESP_LOGW(TAG, "⚠️ 设置 DHCP DNS Option 失败: %s", esp_err_to_name(opt_ret));
     } else {
-        esp_ip4_addr_t offer_dns_ip = {.addr = offer_dns_addr};
-        ESP_LOGI(TAG, "📶 DHCP DNS Option 已设置: " IPSTR, IP2STR(&offer_dns_ip));
+        ESP_LOGI(TAG, "📶 DHCP DNS Option 已设置: " IPSTR, IP2STR(&offer_dns.ip.u_addr.ip4));
     }
     esp_err_t start_ret = esp_netif_dhcps_start(wifi_ap_netif);
     if (start_ret != ESP_OK && start_ret != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
