@@ -40,6 +40,7 @@
 #define WIFI_AP_PASS       "12345678"
 #define WIFI_AP_CHANNEL    6
 #define WIFI_MAX_STA_CONN  4
+#define WIFI_COUNTRY_CODE  "CN"
 
 // ========== 引脚定义 ==========
 // 左旋码（沿用 mcu1_led 配置）
@@ -461,6 +462,8 @@ static esp_err_t wifi_init_sta_ap(void)
     strlcpy((char *)sta_cfg.sta.password, WIFI_STA_PASS, sizeof(sta_cfg.sta.password));
     // 放宽到 WPA，兼容 WPA/WPA2/WPA3 混合网络，避免因阈值过高导致拒连
     sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
+    sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     sta_cfg.sta.pmf_cfg.capable = true;
     sta_cfg.sta.pmf_cfg.required = false;
 
@@ -474,6 +477,10 @@ static esp_err_t wifi_init_sta_ap(void)
     if (strlen(WIFI_AP_PASS) == 0) ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    esp_err_t ctry_ret = esp_wifi_set_country_code(WIFI_COUNTRY_CODE, true);
+    if (ctry_ret != ESP_OK) {
+        ESP_LOGW(TAG, "⚠️ 设置国家码失败: %s", esp_err_to_name(ctry_ret));
+    }
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     if (strcmp(WIFI_STA_SSID, "YOUR_HOME_WIFI") == 0) {
