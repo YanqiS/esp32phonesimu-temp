@@ -407,10 +407,10 @@ static esp_err_t start_bt_phone(void)
 static void start_sntp_if_needed(void)
 {
     if (sntp_started) return;
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_setservername(1, "ntp.aliyun.com");
-    sntp_init();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "ntp.aliyun.com");
+    esp_sntp_init();
     sntp_started = true;
     ESP_LOGI(TAG, "🕒 SNTP 已启动，等待时间同步");
 }
