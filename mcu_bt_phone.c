@@ -128,13 +128,19 @@ static size_t missed_call_count = 0;
 static void pbap_get_datetime(char *out, size_t len)
 {
     time_t now = time(NULL);
+    // 部分板子未配置SNTP/RTC时会返回1970，车机可能直接忽略该时间
+    // 回退到一个递增的伪时间，保证字段可被车机识别显示
+    static time_t pseudo_now = 1767225600; // 2026-01-01T00:00:00Z
+    if (now < 1700000000) { // < 2023-11-14 视为无效系统时钟
+        now = pseudo_now++;
+    }
     struct tm tm_buf;
     struct tm *ptm = gmtime_r(&now, &tm_buf);
     if (ptm == NULL) {
-        strlcpy(out, "19700101T000000Z", len);
+        strlcpy(out, "20260101T000000", len);
         return;
     }
-    strftime(out, len, "%Y%m%dT%H%M%SZ", ptm);
+    strftime(out, len, "%Y%m%dT%H%M%S", ptm);
 }
 
 static void pbap_append_calllog(calllog_t *logs, size_t *count,
@@ -1124,9 +1130,11 @@ static int build_calllog_vcards(char *buf, int max_len, uint8_t format,
                 "N:%s;;;;\r\n"
                 "FN:%s\r\n"
                 "TEL;TYPE=CELL:%s\r\n"
+                "X-IRMC-CALL-DATETIME:%s\r\n"
                 "X-IRMC-CALL-DATETIME;TYPE=%s:%s\r\n"
                 "END:VCARD\r\n",
-                logs[i].name, logs[i].name, logs[i].number, call_type, logs[i].datetime);
+                logs[i].name, logs[i].name, logs[i].number,
+                logs[i].datetime, call_type, logs[i].datetime);
         } else {
             n = snprintf(buf + off, max_len - off,
                 "BEGIN:VCARD\r\n"
@@ -1134,9 +1142,11 @@ static int build_calllog_vcards(char *buf, int max_len, uint8_t format,
                 "N;CHARSET=UTF-8:%s;;;;\r\n"
                 "FN;CHARSET=UTF-8:%s\r\n"
                 "TEL;TYPE=CELL:%s\r\n"
+                "X-IRMC-CALL-DATETIME:%s\r\n"
                 "X-IRMC-CALL-DATETIME;TYPE=%s:%s\r\n"
                 "END:VCARD\r\n",
-                logs[i].name, logs[i].name, logs[i].number, call_type, logs[i].datetime);
+                logs[i].name, logs[i].name, logs[i].number,
+                logs[i].datetime, call_type, logs[i].datetime);
         }
         if (n < 0 || off + n >= max_len) break;
         off += n;
