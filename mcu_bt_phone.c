@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdio.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +20,11 @@
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
 #include "esp_hf_ag_api.h"
+
+// PBAP (通讯录同步) - SPP用于RFCOMM通道，内部SDP API用于注册PBAP服务
+#include "esp_spp_api.h"
+// 需要在 CMakeLists.txt 中添加内部头文件路径（见文件末尾注释）
+#include "stack/sdp_api.h"
 
 #define TAG "BT_PHONE"
 
@@ -45,6 +51,7 @@
 #define CALL_KEY GPIO_NUM_23       // 模拟来电按键
 
 #define DEFAULT_DIAL_NUMBER "13800138000"
+#define CNUM_PHONE_NUMBER "18621880000"  // 本机号码，不能和拨出号码重复，否则车机判定为VoIP
 
 // ========== 全局变量 ==========
 static char my_mac_id[8];
@@ -78,10 +85,11 @@ typedef enum {
     CALL_DIR_INCOMING,
 } call_direction_t;
 static call_direction_t current_call_direction = CALL_DIR_OUTGOING;
- 
+
 // 外拨时 DIALING→ALERTING 的非阻塞定时器
 static TimerHandle_t dial_alerting_timer = NULL;
-
+static void dial_alerting_timer_callback(TimerHandle_t xTimer);
+ 
 typedef struct
 {
     const char *name;
@@ -126,93 +134,95 @@ static void sync_hfp_call_indicators(int call, int callsetup)
     esp_hf_ag_ciev_report(connected_device, ESP_HF_IND_TYPE_SIGNAL, 5);
 }
 
+static void get_hfp_call_snapshot(esp_hf_call_status_t *call, esp_hf_call_setup_status_t *callsetup)
+{
+    if (call == NULL || callsetup == NULL)
+    {
+        return;
+    }
+
+    switch (current_call_state)
+    {
+    case CALL_STATE_ACTIVE:
+        *call = ESP_HF_CALL_STATUS_CALL_IN_PROGRESS;
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_IDLE;
+        break;
+    case CALL_STATE_INCOMING:
+        *call = ESP_HF_CALL_STATUS_NO_CALLS;
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_INCOMING;
+        break;
+    case CALL_STATE_DIALING:
+        *call = ESP_HF_CALL_STATUS_NO_CALLS;  // 标准HFP：拨号中call=0
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING;
+        break;
+    case CALL_STATE_ALERTING:
+        *call = ESP_HF_CALL_STATUS_NO_CALLS;  // 标准HFP：振铃中call=0
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING;
+        break;
+    case CALL_STATE_IDLE:
+    default:
+        *call = ESP_HF_CALL_STATUS_NO_CALLS;
+        *callsetup = ESP_HF_CALL_SETUP_STATUS_IDLE;
+        break;
+    }
+}
+
 static void respond_current_calls(esp_bd_addr_t remote_addr)
 {
+    // esp_hf_ag_clcc_response 底层和 CNUM 一样有 ok_flag bug，不发 OK
+    // 车机查 CLCC 超时 → 丢弃号码 → 显示"网络电话"
+    // 用 unknown_at_send 手工拼 +CLCC 响应 + OK
+    // 格式: +CLCC: idx,dir,stat,mode,mpty,"number",type
+    char clcc_buf[128];
+    int dir;
+
     if (!hfp_connected)
     {
         ESP_LOGW(TAG, "SLC未建立，跳过CLCC响应");
         return;
     }
 
+    dir = (current_call_direction == CALL_DIR_INCOMING) ? 1 : 0;
+
     if (current_call_state == CALL_STATE_DIALING)
     {
         ESP_LOGI(TAG, "CLCC返回: 外拨中 %s", current_phone_number);
-        esp_hf_ag_clcc_response(
-            remote_addr,
-            1,
-            ESP_HF_CURRENT_CALL_DIRECTION_OUTGOING,
-            ESP_HF_CURRENT_CALL_STATUS_DIALING,
-            ESP_HF_CURRENT_CALL_MODE_VOICE,
-            ESP_HF_CURRENT_CALL_MPTY_TYPE_SINGLE,
-            current_phone_number,
-            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        snprintf(clcc_buf, sizeof(clcc_buf),
+            "+CLCC: 1,%d,2,0,0,\"%s\",129\r\n\r\nOK", dir, current_phone_number);
+        esp_hf_ag_unknown_at_send(remote_addr, clcc_buf);
         return;
     }
 
     if (current_call_state == CALL_STATE_ACTIVE)
     {
         ESP_LOGI(TAG, "CLCC返回: 通话中 %s", current_phone_number);
-        esp_hf_ag_clcc_response(
-            remote_addr,
-            1,
-            ESP_HF_CURRENT_CALL_DIRECTION_OUTGOING,
-            ESP_HF_CURRENT_CALL_STATUS_ACTIVE,
-            ESP_HF_CURRENT_CALL_MODE_VOICE,
-            ESP_HF_CURRENT_CALL_MPTY_TYPE_SINGLE,
-            current_phone_number,
-            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        snprintf(clcc_buf, sizeof(clcc_buf),
+            "+CLCC: 1,%d,0,0,0,\"%s\",129\r\n\r\nOK", dir, current_phone_number);
+        esp_hf_ag_unknown_at_send(remote_addr, clcc_buf);
         return;
     }
 
     if (current_call_state == CALL_STATE_ALERTING)
     {
         ESP_LOGI(TAG, "CLCC返回: 对方振铃 %s", current_phone_number);
-        esp_hf_ag_clcc_response(
-            remote_addr,
-            1,
-            ESP_HF_CURRENT_CALL_DIRECTION_OUTGOING,
-            ESP_HF_CURRENT_CALL_STATUS_ALERTING,
-            ESP_HF_CURRENT_CALL_MODE_VOICE,
-            ESP_HF_CURRENT_CALL_MPTY_TYPE_SINGLE,
-            current_phone_number,
-            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        snprintf(clcc_buf, sizeof(clcc_buf),
+            "+CLCC: 1,0,3,0,0,\"%s\",129\r\n\r\nOK", current_phone_number);
+        esp_hf_ag_unknown_at_send(remote_addr, clcc_buf);
         return;
     }
 
     if (current_call_state == CALL_STATE_INCOMING)
     {
         ESP_LOGI(TAG, "CLCC返回: 来电中 %s", current_phone_number);
-        esp_hf_ag_clcc_response(
-            remote_addr,
-            1,
-            ESP_HF_CURRENT_CALL_DIRECTION_INCOMING,
-            ESP_HF_CURRENT_CALL_STATUS_INCOMING,
-            ESP_HF_CURRENT_CALL_MODE_VOICE,
-            ESP_HF_CURRENT_CALL_MPTY_TYPE_SINGLE,
-            current_phone_number,
-            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        snprintf(clcc_buf, sizeof(clcc_buf),
+            "+CLCC: 1,1,4,0,0,\"%s\",129\r\n\r\nOK", current_phone_number);
+        esp_hf_ag_unknown_at_send(remote_addr, clcc_buf);
         return;
     }
 
-    ESP_LOGI(TAG, "当前没有活动呼叫，CLCC返回空列表");
-}
-
-// 定时器回调：外拨1秒后从DIALING切到ALERTING
-static void dial_alerting_timer_callback(TimerHandle_t xTimer)
-{
-    if (current_call_state == CALL_STATE_DIALING && hfp_connected)
-    {
-        current_call_state = CALL_STATE_ALERTING;
-        ESP_LOGI(TAG, "📞 对方振铃中...");
-        esp_hf_ag_out_call(
-            connected_device,
-            0,
-            0,
-            ESP_HF_CALL_STATUS_NO_CALLS,
-            ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING,
-            current_phone_number,
-            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
-    }
+    // 空闲时也必须回 OK，否则车机等 OK 超时
+    ESP_LOGI(TAG, "当前没有活动呼叫，CLCC返回空");
+    esp_hf_ag_unknown_at_send(remote_addr, "\r\nOK");
 }
 
 static int read_bcd(gpio_num_t bit1, gpio_num_t bit2, gpio_num_t bit4, gpio_num_t bit8)
@@ -223,6 +233,23 @@ static int read_bcd(gpio_num_t bit1, gpio_num_t bit2, gpio_num_t bit4, gpio_num_
     val |= (gpio_get_level(bit4) == 0) ? 4 : 0;
     val |= (gpio_get_level(bit8) == 0) ? 8 : 0;
     return val;
+}
+
+// 定时器回调：外拨1秒后从DIALING切到ALERTING（非阻塞）
+static void dial_alerting_timer_callback(TimerHandle_t xTimer)
+{
+    if (current_call_state == CALL_STATE_DIALING && hfp_connected)
+    {
+        current_call_state = CALL_STATE_ALERTING;
+        ESP_LOGI(TAG, "📞 对方振铃中...");
+        esp_hf_ag_out_call(
+            connected_device, 0, 0,
+            ESP_HF_CALL_STATUS_NO_CALLS,
+            ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING,
+            current_phone_number,
+            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        sync_hfp_call_indicators(0, 3);
+    }
 }
 
 static esp_err_t bt_init(void);
@@ -240,8 +267,11 @@ static esp_err_t configure_bt_identity(void)
 
     esp_bt_cod_t cod = {
         .major = ESP_BT_COD_MAJOR_DEV_PHONE,
-        .minor = 0,
-        .service = ESP_BT_COD_SRVC_TELEPHONY,
+        .minor = 3,  // 3 = Smartphone (0=Uncategorized, 1=Cellular, 2=Cordless)
+        .service = ESP_BT_COD_SRVC_TELEPHONY | ESP_BT_COD_SRVC_AUDIO |
+                   ESP_BT_COD_SRVC_OBJ_TRANSFER | ESP_BT_COD_SRVC_CAPTURING |
+                   ESP_BT_COD_SRVC_RENDERING | ESP_BT_COD_SRVC_NETWORKING |
+                   ESP_BT_COD_SRVC_INFORMATION,
     };
     ret = esp_bt_gap_set_cod(cod, ESP_BT_INIT_COD);
     if (ret != ESP_OK)
@@ -477,6 +507,8 @@ void simulate_incoming_call(const char *phone_number)
 // 接听来电
 void handle_call_answer(void)
 {
+    if (dial_alerting_timer != NULL) xTimerStop(dial_alerting_timer, 0);
+
     if (current_call_state != CALL_STATE_INCOMING &&
         current_call_state != CALL_STATE_ALERTING &&
         current_call_state != CALL_STATE_DIALING)
@@ -552,6 +584,8 @@ void handle_call_answer(void)
 // 拒接来电
 void handle_call_reject(void)
 {
+    if (dial_alerting_timer != NULL) xTimerStop(dial_alerting_timer, 0);
+
     if (current_call_state != CALL_STATE_INCOMING)
     {
         ESP_LOGW(TAG, "❌ 当前无来电，无法拒接");
@@ -592,6 +626,8 @@ void handle_call_reject(void)
 // 挂断电话
 void handle_call_hangup(void)
 {
+    if (dial_alerting_timer != NULL) xTimerStop(dial_alerting_timer, 0);
+
     if (current_call_state != CALL_STATE_ACTIVE)
     {
         ESP_LOGW(TAG, "❌ 当前无通话，无法挂断");
@@ -658,6 +694,7 @@ void handle_call_dial(const char *number)
 
     strncpy(current_phone_number, number, sizeof(current_phone_number) - 1);
     current_call_state = CALL_STATE_DIALING;
+    current_call_direction = CALL_DIR_OUTGOING;
     led_mode = 3; // 绿灯快闪
 
     // 发送外拨应答
@@ -669,21 +706,23 @@ void handle_call_dial(const char *number)
         ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING,    // 2
         current_phone_number,
         ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+    sync_hfp_call_indicators(0, 2);
 
-    // 模拟对方振铃
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    if (current_call_state == CALL_STATE_DIALING)
+    // 用定时器延迟1秒切到ALERTING，避免阻塞BT协议栈回调
+    if (dial_alerting_timer == NULL)
     {
-        current_call_state = CALL_STATE_ALERTING;
-        ESP_LOGI(TAG, "📞 对方振铃中...");
-        esp_hf_ag_out_call(
-            connected_device,
-            0,
-            0,
-            ESP_HF_CALL_STATUS_NO_CALLS,
-            ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING, // 3
-            current_phone_number,
-            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        dial_alerting_timer = xTimerCreate("dial_alert", pdMS_TO_TICKS(1000),
+            pdFALSE, NULL, dial_alerting_timer_callback);
+    }
+    if (dial_alerting_timer != NULL)
+    {
+        xTimerStop(dial_alerting_timer, 0);
+        xTimerStart(dial_alerting_timer, 0);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "⚠️ 定时器不可用，立即切换到对方振铃");
+        dial_alerting_timer_callback(NULL);
     }
 
     ESP_LOGI(TAG, "💡 等待对端接听：板子旋钮2→0可接通，旋钮3→0可取消");
@@ -715,18 +754,12 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             hfp_connected = true;
             memcpy(connected_device, bda, 6);
             led_mode = 2; // 绿灯常亮
- 
-            if (bsir_ret != ESP_OK)
-            {
-                ESP_LOGW(TAG, "BSIR 通知失败: %s", esp_err_to_name(bsir_ret));
-            }
-            else
-            {
-                ESP_LOGI(TAG, "✓ 已通知车机支持 In-Band Ring Tone");
-            }  
+
+            ESP_LOGI(TAG, "✓ HFP SLC已建立");
         }
         else
         {
+            if (dial_alerting_timer != NULL) xTimerStop(dial_alerting_timer, 0);
             hfp_connected = false;
             memset(connected_device, 0, 6);
             current_call_state = CALL_STATE_IDLE;
@@ -757,6 +790,7 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
     case ESP_HF_CHUP_RESPONSE_EVT:
         // 车机按下了"挂断/拒接"按钮
         ESP_LOGI(TAG, "🎯 车机发送挂断命令");
+        if (dial_alerting_timer != NULL) xTimerStop(dial_alerting_timer, 0);
         if (current_call_state == CALL_STATE_INCOMING)
         {
             handle_call_reject();
@@ -764,6 +798,21 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         else if (current_call_state == CALL_STATE_ACTIVE)
         {
             handle_call_hangup();
+        }
+        else if (current_call_state == CALL_STATE_DIALING ||
+                 current_call_state == CALL_STATE_ALERTING)
+        {
+            current_call_state = CALL_STATE_IDLE;
+            led_mode = 2;
+            esp_hf_ag_end_call(connected_device, 0, 0,
+                ESP_HF_CALL_STATUS_NO_CALLS,
+                ESP_HF_CALL_SETUP_STATUS_IDLE,
+                current_phone_number,
+                ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+            sync_hfp_call_indicators(0, 0);
+            esp_hf_ag_audio_disconnect(connected_device);
+            memset(current_phone_number, 0, sizeof(current_phone_number));
+            ESP_LOGI(TAG, "📵 车机取消外拨");
         }
         break;
 
@@ -797,26 +846,36 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         break;
 
     case ESP_HF_CIND_RESPONSE_EVT:
-        ESP_LOGI(TAG, "HF请求CIND，返回空闲设备状态");
-            esp_hf_ag_cind_response(
+    {
+        esp_hf_call_status_t call = ESP_HF_CALL_STATUS_NO_CALLS;
+        esp_hf_call_setup_status_t callsetup = ESP_HF_CALL_SETUP_STATUS_IDLE;
+        get_hfp_call_snapshot(&call, &callsetup);
+        ESP_LOGI(TAG, "HF请求CIND，返回当前通话状态(call=%d, setup=%d)", call, callsetup);
+        esp_hf_ag_cind_response(
             param->cind_rep.remote_addr,
-            ESP_HF_CALL_STATUS_NO_CALLS,
-            ESP_HF_CALL_SETUP_STATUS_IDLE,
+            call,
+            callsetup,
             ESP_HF_NETWORK_STATE_AVAILABLE,
             5,
             0,
             5,
             0);
         break;
+    }
 
     case ESP_HF_COPS_RESPONSE_EVT:
         ESP_LOGI(TAG, "HF请求运营商信息");
-        esp_hf_ag_cops_response(param->cops_rep.remote_addr, "ESP32 Phone");
+        esp_hf_ag_cops_response(param->cops_rep.remote_addr, "CMCC");
         break;
 
     case ESP_HF_CNUM_RESPONSE_EVT:
+        // esp_hf_ag_cnum_response 底层同样有 ok_flag bug，不会发 OK
+        // 车机等 OK 超时 7 秒 → 认为无法获取本机号码 → 标记为"网络电话"
+        // 用 unknown_at_send 手工拼完整 +CNUM 响应 + OK
+        // 格式: +CNUM: ,"号码",type,,service
         ESP_LOGI(TAG, "HF请求本机号码");
-        esp_hf_ag_cnum_response(param->cnum_rep.remote_addr, DEFAULT_DIAL_NUMBER, 129, 0);
+        esp_hf_ag_unknown_at_send(param->cnum_rep.remote_addr,
+            "+CNUM: ,\"" CNUM_PHONE_NUMBER "\",129,,4\r\n\r\nOK");
         break;
 
     case ESP_HF_CLCC_RESPONSE_EVT:
@@ -825,9 +884,42 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         break;
 
     case ESP_HF_UNAT_RESPONSE_EVT:
-        ESP_LOGW(TAG, "收到未知AT命令: %s", param->unat_rep.unat ? param->unat_rep.unat : "(null)");
-        esp_hf_ag_unknown_at_send(param->unat_rep.remote_addr, NULL);
+    {
+        const char *unat = param->unat_rep.unat;
+        ESP_LOGW(TAG, "收到未知AT命令: %s", unat ? unat : "(null)");
+
+        // 车机通过 CGMI/CGMM/CGMR 判断是否为真实手机
+        // 全部返回ERROR → 车机认定为"网络电话"设备
+        //
+        // ESP-IDF bug: esp_hf_ag_unknown_at_send 在BTC层没有把 ok_flag 设为
+        // BTA_AG_OK_DONE，导致 bta_ag_send_ok 不会被调用。
+        // 底层 bta_ag_send_result 输出: \r\n<str>\r\n
+        // 所以我们把 \r\n\r\nOK 嵌到字符串尾部，让完整响应变成:
+        //   \r\nSamsung\r\n\r\nOK\r\n  ← 标准AT响应格式
+        if (unat != NULL && strstr(unat, "+CGMI") != NULL)
+        {
+            ESP_LOGI(TAG, "📱 回复手机厂商: Samsung");
+            esp_hf_ag_unknown_at_send(param->unat_rep.remote_addr,
+                "Samsung\r\n\r\nOK");
+        }
+        else if (unat != NULL && strstr(unat, "+CGMM") != NULL)
+        {
+            ESP_LOGI(TAG, "📱 回复手机型号: SM-G998B");
+            esp_hf_ag_unknown_at_send(param->unat_rep.remote_addr,
+                "SM-G998B\r\n\r\nOK");
+        }
+        else if (unat != NULL && strstr(unat, "+CGMR") != NULL)
+        {
+            ESP_LOGI(TAG, "📱 回复固件版本: G998BXXS9FXA1");
+            esp_hf_ag_unknown_at_send(param->unat_rep.remote_addr,
+                "G998BXXS9FXA1\r\n\r\nOK");
+        }
+        else
+        {
+            esp_hf_ag_unknown_at_send(param->unat_rep.remote_addr, NULL);
+        }
         break;
+    }
 
     default:
         ESP_LOGD(TAG, "HFP未处理事件: %d", event);
@@ -878,6 +970,424 @@ static void bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
         ESP_LOGD(TAG, "GAP未处理事件: %d", event);
         break;
     }
+}
+
+/* ===================== PBAP 通讯录同步 ===================== */
+
+// PBAP Target UUID (OBEX连接用)
+static const uint8_t pbap_target_uuid[16] = {
+    0x79,0x61,0x35,0xf0, 0xf0,0xc5,0x11,0xd8,
+    0x09,0x66,0x08,0x00, 0x20,0x0c,0x9a,0x66
+};
+
+// SDP数据类型常量（来自 sdpdefs.h，此处本地定义避免头文件依赖）
+#ifndef UINT_DESC_TYPE
+#define UINT_DESC_TYPE  1
+#endif
+
+static uint32_t pbap_sdp_handle = 0;
+static uint32_t pbap_spp_hdl = 0;
+static uint8_t  pbap_scn = 0;
+static uint16_t pbap_peer_mtu = 255;
+static bool     pbap_inited = false;
+
+// 延迟发送机制：esp_spp_write 不能在 SPP 回调(BTC任务)中直接调用，
+// 否则会往同一个 BTC 队列递归投递消息导致 assert 崩溃。
+// 解决：把待发数据存下来，用 FreeRTOS 定时器从定时器任务中发送。
+static uint8_t  *pbap_tx_buf = NULL;
+static uint16_t  pbap_tx_len = 0;
+static uint32_t  pbap_tx_handle = 0;
+static TimerHandle_t pbap_tx_timer = NULL;
+
+static void pbap_tx_timer_cb(TimerHandle_t xTimer)
+{
+    if (pbap_tx_buf && pbap_tx_len > 0 && pbap_tx_handle) {
+        esp_spp_write(pbap_tx_handle, pbap_tx_len, pbap_tx_buf);
+        free(pbap_tx_buf);
+        pbap_tx_buf = NULL;
+        pbap_tx_len = 0;
+        ESP_LOGI(TAG, "📒 PBAP 数据已发送");
+    }
+}
+
+// 生成全部联系人的 vCard 2.1 数据
+static int build_phonebook_vcards(char *buf, int max_len)
+{
+    int off = 0;
+    for (size_t i = 0; i < sizeof(phonebook)/sizeof(phonebook[0]); i++) {
+        int n = snprintf(buf + off, max_len - off,
+            "BEGIN:VCARD\r\n"
+            "VERSION:2.1\r\n"
+            "N;CHARSET=UTF-8:%s;;;;\r\n"
+            "FN;CHARSET=UTF-8:%s\r\n"
+            "TEL;CELL:%s\r\n"
+            "END:VCARD\r\n",
+            phonebook[i].name, phonebook[i].name, phonebook[i].number);
+        if (n < 0 || off + n >= max_len) break;
+        off += n;
+    }
+    return off;
+}
+
+// 生成 vCard-listing XML（车机浏览联系人列表时请求）
+static int build_vcard_listing(char *buf, int max_len)
+{
+    int off = 0;
+    off += snprintf(buf + off, max_len - off,
+        "<?xml version=\"1.0\"?>\r\n"
+        "<!DOCTYPE vcard-listing SYSTEM \"vcard-listing.dtd\">\r\n"
+        "<vCard-listing version=\"1.0\">\r\n");
+    for (size_t i = 0; i < sizeof(phonebook)/sizeof(phonebook[0]); i++) {
+        off += snprintf(buf + off, max_len - off,
+            "<card handle=\"%d.vcf\" name=\"%s\"/>\r\n",
+            (int)(i + 1), phonebook[i].name);
+    }
+    off += snprintf(buf + off, max_len - off, "</vCard-listing>\r\n");
+    return off;
+}
+
+// 发送 OBEX 响应（延迟到定时器任务中执行，避免在 BTC 回调中调 esp_spp_write）
+static void obex_send(uint32_t handle, uint8_t code,
+                      const uint8_t *payload, uint16_t payload_len)
+{
+    uint16_t total = 3 + payload_len;
+    uint8_t *pkt = malloc(total);
+    if (!pkt) return;
+    pkt[0] = code;
+    pkt[1] = (total >> 8) & 0xFF;
+    pkt[2] = total & 0xFF;
+    if (payload_len > 0) memcpy(pkt + 3, payload, payload_len);
+
+    // 释放上一次未发完的数据（正常不会发生）
+    if (pbap_tx_buf) free(pbap_tx_buf);
+    pbap_tx_buf = pkt;      // 转移所有权，不在这里 free
+    pbap_tx_len = total;
+    pbap_tx_handle = handle;
+
+    if (pbap_tx_timer == NULL) {
+        pbap_tx_timer = xTimerCreate("pbap_tx", 1, pdFALSE, NULL, pbap_tx_timer_cb);
+    }
+    if (pbap_tx_timer) {
+        xTimerStart(pbap_tx_timer, 0);
+    }
+}
+
+// 发送 OBEX 响应，带 End-of-Body
+static void obex_send_body(uint32_t handle, const char *body, int body_len)
+{
+    uint16_t hdr_len = 3 + body_len;  // End-of-Body header: id(1) + len(2) + data
+    uint8_t *resp = malloc(hdr_len);
+    if (!resp) return;
+    int p = 0;
+    resp[p++] = 0x49;  // End of Body
+    resp[p++] = (hdr_len >> 8) & 0xFF;
+    resp[p++] = hdr_len & 0xFF;
+    memcpy(resp + p, body, body_len);
+    obex_send(handle, 0xA0, resp, hdr_len);  // 0xA0 = SUCCESS
+    free(resp);
+}
+
+// 处理 OBEX CONNECT
+static void obex_handle_connect(uint32_t handle, const uint8_t *data, uint16_t len)
+{
+    if (len < 7) return;
+    uint16_t remote_mtu = (data[5] << 8) | data[6];
+    if (remote_mtu > 64) pbap_peer_mtu = remote_mtu;
+
+    uint8_t resp[32];
+    int p = 0;
+    resp[p++] = 0x10;  // OBEX version 1.0
+    resp[p++] = 0x00;  // flags
+    uint16_t our_mtu = 1024;
+    resp[p++] = (our_mtu >> 8) & 0xFF;
+    resp[p++] = our_mtu & 0xFF;
+    // Who header（必须与 Target 相同，车机据此确认是 PBAP）
+    resp[p++] = 0x4A;  // Who
+    uint16_t who_len = 3 + 16;
+    resp[p++] = (who_len >> 8) & 0xFF;
+    resp[p++] = who_len & 0xFF;
+    memcpy(resp + p, pbap_target_uuid, 16); p += 16;
+    // Connection ID
+    resp[p++] = 0xCB;
+    resp[p++] = 0x00; resp[p++] = 0x00; resp[p++] = 0x00; resp[p++] = 0x01;
+
+    obex_send(handle, 0xA0, resp, p);
+    ESP_LOGI(TAG, "📒 PBAP OBEX 连接成功 (peer MTU=%d)", pbap_peer_mtu);
+}
+
+// 构建 PBAP Application Parameters 响应头（PhonebookSize + NewMissedCalls）
+static int build_app_params_response(uint8_t *buf, uint16_t pb_size)
+{
+    int p = 0;
+    // OBEX header: Application Parameters (0x4C), byte-sequence
+    buf[p++] = 0x4C;
+    // 长度占位，稍后填
+    int len_pos = p; p += 2;
+    // Tag 0x08: PhonebookSize (UINT16 big-endian)
+    buf[p++] = 0x08;
+    buf[p++] = 0x02;
+    buf[p++] = (pb_size >> 8) & 0xFF;
+    buf[p++] = pb_size & 0xFF;
+    // Tag 0x09: NewMissedCalls (UINT8)
+    buf[p++] = 0x09;
+    buf[p++] = 0x01;
+    buf[p++] = 0x00;
+    // 填长度（含 header ID + length 本身）
+    uint16_t total_hdr_len = p;
+    buf[len_pos]     = (total_hdr_len >> 8) & 0xFF;
+    buf[len_pos + 1] = total_hdr_len & 0xFF;
+    return p;
+}
+
+// 处理 OBEX GET（车机请求通讯录数据）
+static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
+{
+    uint16_t pos = 3;  // 跳过 opcode + length
+    bool want_phonebook = false;
+    bool want_listing = false;
+    uint16_t max_list_count = 0xFFFF;  // 默认：全部下载
+    bool has_max_list_count = false;
+
+    // ===== 解析所有 OBEX headers =====
+    while (pos + 1 <= len) {
+        uint8_t hid = data[pos];
+        uint8_t hi = hid >> 6;
+
+        if (hi == 0 || hi == 1) {  // Unicode(0) 或 byte-seq(1)，2字节长度
+            if (pos + 3 > len) break;
+            uint16_t hlen = (data[pos+1] << 8) | data[pos+2];
+            if (hlen < 3 || pos + hlen > len) break;
+
+            if (hid == 0x42) {  // Type header
+                const char *t = (const char *)data + pos + 3;
+                ESP_LOGI(TAG, "📒 GET Type: %.*s", (int)(hlen - 3), t);
+                if (strstr(t, "x-bt/phonebook"))     want_phonebook = true;
+                if (strstr(t, "x-bt/vcard-listing")) want_listing = true;
+                if (strstr(t, "x-bt/vcard"))         want_phonebook = true;
+            }
+            else if (hid == 0x01) {  // Name header (UTF-16BE)
+                for (uint16_t k = pos + 3; k + 3 < pos + hlen; k += 2) {
+                    if (data[k]==0 && data[k+1]=='p' && data[k+2]==0 && data[k+3]=='b') {
+                        want_phonebook = true;
+                        break;
+                    }
+                }
+            }
+            else if (hid == 0x4C) {  // Application Parameters
+                // 解析 tag-length-value
+                uint16_t ap_end = pos + hlen;
+                uint16_t ap = pos + 3;
+                while (ap + 2 <= ap_end) {
+                    uint8_t tag = data[ap];
+                    uint8_t tlen = data[ap + 1];
+                    if (ap + 2 + tlen > ap_end) break;
+                    if (tag == 0x04 && tlen == 2) {  // MaxListCount
+                        max_list_count = (data[ap+2] << 8) | data[ap+3];
+                        has_max_list_count = true;
+                        ESP_LOGI(TAG, "📒 GET MaxListCount=%d", max_list_count);
+                    }
+                    ap += 2 + tlen;
+                }
+            }
+            pos += hlen;
+        } else if (hi == 3) { pos += 5; }  // 4字节值 (Connection ID 等)
+          else if (hi == 2) { pos += 2; }  // 1字节值
+          else break;
+    }
+
+    if (!want_phonebook && !want_listing) {
+        ESP_LOGW(TAG, "📒 GET 未识别类型，默认返回通讯录");
+        want_phonebook = true;
+    }
+
+    uint16_t pb_count = (uint16_t)(sizeof(phonebook) / sizeof(phonebook[0]));
+
+    // ===== MaxListCount == 0：车机只想知道有多少条，不要数据 =====
+    if (has_max_list_count && max_list_count == 0) {
+        uint8_t resp[16];
+        int rlen = build_app_params_response(resp, pb_count);
+        obex_send(handle, 0xA0, resp, rlen);
+        ESP_LOGI(TAG, "📒 PBAP 回复通讯录大小: %d 条", pb_count);
+        return;
+    }
+
+    // ===== 正常下载通讯录 =====
+    if (want_phonebook) {
+        char *vcards = malloc(2048);
+        if (!vcards) { obex_send(handle, 0xD3, NULL, 0); return; }
+        int vlen = build_phonebook_vcards(vcards, 2048);
+
+        // 构建响应：App Params + End-of-Body
+        uint8_t app_params[16];
+        int ap_len = build_app_params_response(app_params, pb_count);
+
+        uint16_t eob_hdr_len = 3 + vlen;  // End-of-Body: id(1)+len(2)+data
+        uint16_t payload_len = ap_len + eob_hdr_len;
+        uint8_t *payload = malloc(payload_len);
+        if (!payload) { free(vcards); obex_send(handle, 0xD3, NULL, 0); return; }
+
+        int p = 0;
+        memcpy(payload + p, app_params, ap_len); p += ap_len;
+        payload[p++] = 0x49;  // End of Body
+        payload[p++] = (eob_hdr_len >> 8) & 0xFF;
+        payload[p++] = eob_hdr_len & 0xFF;
+        memcpy(payload + p, vcards, vlen); p += vlen;
+
+        obex_send(handle, 0xA0, payload, p);
+        free(payload);
+        free(vcards);
+        ESP_LOGI(TAG, "📒 PBAP 发送通讯录 (%d bytes, %d 联系人)", vlen, pb_count);
+    } else if (want_listing) {
+        char *listing = malloc(1024);
+        if (!listing) { obex_send(handle, 0xD3, NULL, 0); return; }
+        int llen = build_vcard_listing(listing, 1024);
+        obex_send_body(handle, listing, llen);
+        free(listing);
+        ESP_LOGI(TAG, "📒 PBAP 发送联系人列表");
+    }
+}
+
+// 创建 PBAP PSE 的 SDP 记录（让车机能通过 SDP 搜索发现 PBAP 服务）
+static void pbap_create_sdp(uint8_t scn)
+{
+    pbap_sdp_handle = SDP_CreateRecord();
+    if (pbap_sdp_handle == 0) {
+        ESP_LOGE(TAG, "📒 创建 PBAP SDP 记录失败");
+        return;
+    }
+
+    // Service Class: PBAP PSE (0x112F)
+    uint16_t svc_class = 0x112F;
+    SDP_AddServiceClassIdList(pbap_sdp_handle, 1, &svc_class);
+
+    // Protocol: L2CAP → RFCOMM(scn) → OBEX
+    tSDP_PROTOCOL_ELEM proto[3];
+    memset(proto, 0, sizeof(proto));
+    proto[0].protocol_uuid = 0x0100;  // L2CAP
+    proto[0].num_params = 0;
+    proto[1].protocol_uuid = 0x0003;  // RFCOMM
+    proto[1].num_params = 1;
+    proto[1].params[0] = scn;
+    proto[2].protocol_uuid = 0x0008;  // OBEX
+    proto[2].num_params = 0;
+    SDP_AddProtocolList(pbap_sdp_handle, 3, proto);
+
+    // Profile: Phonebook Access v1.2
+    SDP_AddProfileDescriptorList(pbap_sdp_handle, 0x1130, 0x0102);
+
+    // Service Name (attribute 0x0100, text string type=4)
+    const char *svc_name = "Phonebook Access PSE";
+    SDP_AddAttribute(pbap_sdp_handle, 0x0100, 4, strlen(svc_name) + 1, (uint8_t *)svc_name);
+
+    // Supported Repositories: Local Phonebook (bit 0)
+    uint8_t repos = 0x01;
+    SDP_AddAttribute(pbap_sdp_handle, 0x0314, UINT_DESC_TYPE, 1, &repos);
+
+    ESP_LOGI(TAG, "📒 PBAP SDP 记录已创建 (SCN=%d, handle=0x%lx)",
+             scn, (unsigned long)pbap_sdp_handle);
+}
+
+// SPP 回调（PBAP 通过 SPP 的 RFCOMM 通道传输 OBEX 数据）
+static void pbap_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_SPP_INIT_EVT:
+        if (param->init.status == ESP_SPP_SUCCESS) {
+            // scn=0: 让协议栈自动分配通道号
+            esp_spp_start_srv(ESP_SPP_SEC_AUTHENTICATE, ESP_SPP_ROLE_SLAVE,
+                              0, "PBAP_PSE");
+        } else {
+            ESP_LOGE(TAG, "📒 SPP 初始化失败: %d", param->init.status);
+        }
+        break;
+
+    case ESP_SPP_START_EVT:
+        if (param->start.status == ESP_SPP_SUCCESS) {
+            pbap_scn = param->start.scn;
+            pbap_create_sdp(pbap_scn);
+            ESP_LOGI(TAG, "📒 PBAP 服务就绪 (RFCOMM SCN=%d)", pbap_scn);
+        }
+        break;
+
+    case ESP_SPP_SRV_OPEN_EVT:
+        pbap_spp_hdl = param->srv_open.handle;
+        ESP_LOGI(TAG, "📒 PBAP 客户端已连接 (handle=%" PRIu32 ")", pbap_spp_hdl);
+        break;
+
+    case ESP_SPP_DATA_IND_EVT:
+    {
+        uint8_t *d = param->data_ind.data;
+        uint16_t l = param->data_ind.len;
+        if (l < 1) break;
+        ESP_LOGI(TAG, "📒 PBAP OBEX opcode=0x%02X len=%d", d[0], l);
+
+        switch (d[0]) {
+        case 0x80:          // CONNECT
+            obex_handle_connect(param->data_ind.handle, d, l);
+            break;
+        case 0x03: case 0x83: // GET / GET Final
+            obex_handle_get(param->data_ind.handle, d, l);
+            break;
+        case 0x81:          // DISCONNECT
+        case 0x85:          // SETPATH（车机切换目录，直接返回成功）
+            obex_send(param->data_ind.handle, 0xA0, NULL, 0);
+            ESP_LOGI(TAG, "📒 PBAP %s", d[0]==0x81 ? "DISCONNECT" : "SETPATH→OK");
+            break;
+        default:
+            obex_send(param->data_ind.handle, 0xC6, NULL, 0); // NOT ACCEPTABLE
+            ESP_LOGW(TAG, "📒 PBAP 未知 OBEX 0x%02X", d[0]);
+            break;
+        }
+        break;
+    }
+
+    case ESP_SPP_CLOSE_EVT:
+        pbap_spp_hdl = 0;
+        ESP_LOGI(TAG, "📒 PBAP 连接关闭");
+        break;
+
+    default:
+        break;
+    }
+}
+
+// PBAP 初始化
+static esp_err_t pbap_init(void)
+{
+    esp_err_t ret = esp_spp_register_callback(pbap_spp_cb);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "📒 SPP 回调注册失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    esp_spp_cfg_t spp_cfg = {
+        .mode = ESP_SPP_MODE_CB,
+    };
+    ret = esp_spp_enhanced_init(&spp_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "📒 SPP 初始化失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    pbap_inited = true;
+    ESP_LOGI(TAG, "📒 PBAP 模块初始化中...");
+    return ESP_OK;
+}
+
+// PBAP 反初始化
+static void pbap_deinit(void)
+{
+    if (!pbap_inited) return;
+    if (pbap_tx_timer) { xTimerStop(pbap_tx_timer, 0); }
+    if (pbap_tx_buf) { free(pbap_tx_buf); pbap_tx_buf = NULL; }
+    if (pbap_sdp_handle) {
+        SDP_DeleteRecord(pbap_sdp_handle);
+        pbap_sdp_handle = 0;
+    }
+    esp_spp_deinit();
+    pbap_inited = false;
+    pbap_spp_hdl = 0;
+    pbap_scn = 0;
 }
 
 /* ===================== 蓝牙初始化 ===================== */
@@ -979,6 +1489,13 @@ static esp_err_t bt_init(void)
         goto fail;
     }
 
+    // 初始化 PBAP（通讯录同步），失败不影响电话功能
+    ret = pbap_init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "⚠️ PBAP 初始化失败，通讯录同步不可用");
+    }
+
     ESP_LOGI(TAG, "✓ 蓝牙手机模拟器初始化成功，设备名: %s", bt_name);
     ESP_LOGI(TAG, "ℹ️ 手机可配对但通常不会建立HFP连接；车机/耳机等HF设备才会连接HFP AG");
     return ESP_OK;
@@ -1010,6 +1527,9 @@ fail:
 
 static void bt_deinit(void)
 {
+    // 关闭PBAP
+    pbap_deinit();
+
     // 关闭HFP AG
     esp_hf_ag_deinit();
     esp_a2d_source_deinit();
@@ -1124,14 +1644,66 @@ static void button_task(void *arg)
 
 static void switch_monitor_task(void *arg)
 {
+    int last_left = -1;
     int last_right = -1;
+    int left_max_seen_position = 0;
     int max_seen_position = 0;
+    TickType_t left_ignore_until = 0;
     TickType_t ignore_until = 0;
 
     while (1)
     {
+        int left = read_bcd(BCD1_1, BCD1_2, BCD1_4, BCD1_8);
         int right = read_bcd(BCD2_1, BCD2_2, BCD2_4, BCD2_8);
         TickType_t now = xTaskGetTickCount();
+
+        if (left != last_left && now >= left_ignore_until)
+        {
+            ESP_LOGI(TAG, "旋钮1: %d", left);
+
+            if (left_max_seen_position == 0 && left == 0)
+            {
+                // 初始态
+            }
+            else if (left >= 1 && left <= 3)
+            {
+                if (left > left_max_seen_position)
+                {
+                    left_max_seen_position = left;
+                    ESP_LOGI(TAG, "[旋钮1] 当前最高挡位=%d", left_max_seen_position);
+                }
+            }
+            else if (left_max_seen_position >= 1 && left == 0)
+            {
+                const char *dial_number = DEFAULT_DIAL_NUMBER;
+                if (left_max_seen_position == 2)
+                {
+                    dial_number = "13501693774";
+                }
+                else if (left_max_seen_position >= 3)
+                {
+                    dial_number = "13600136000";
+                }
+
+                ESP_LOGI(TAG, "📲 [旋钮1] 触发模拟呼出: %s", dial_number);
+                handle_call_dial(dial_number);
+                left_max_seen_position = 0;
+                left_ignore_until = now + pdMS_TO_TICKS(300);
+            }
+            else
+            {
+                if (left == 0)
+                {
+                    left_max_seen_position = 0;
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "[旋钮1] 经过中间挡位%d，等待回到0触发最高挡位=%d", left, left_max_seen_position);
+                }
+            }
+
+            last_left = left;
+        }
 
         if (right != last_right && now >= ignore_until)
         {
@@ -1174,8 +1746,10 @@ static void switch_monitor_task(void *arg)
                 {
                     handle_call_hangup();
                 }
-                else if (current_call_state == CALL_STATE_DIALING)
+                else if (current_call_state == CALL_STATE_DIALING ||
+                         current_call_state == CALL_STATE_ALERTING)
                 {
+                    if (dial_alerting_timer != NULL) xTimerStop(dial_alerting_timer, 0);
                     current_call_state = CALL_STATE_IDLE;
                     led_mode = 2;
                     esp_hf_ag_end_call(
@@ -1303,6 +1877,7 @@ void app_main(void)
     ESP_LOGI(TAG, "💡 系统就绪");
     ESP_LOGI(TAG, "💡 上电后会自动启动蓝牙，BOOT键可手动重启");
     ESP_LOGI(TAG, "💡 按CALL键 (GPIO23) 模拟来电");
+    ESP_LOGI(TAG, "💡 旋钮1: 1→0呼出13800138000, 2→0呼出13501693774, 3→0呼出13600136000");
     ESP_LOGI(TAG, "💡 旋钮2: 1→0模拟来电, 2→0接通, 3→0挂断/拒接");
     ESP_LOGI(TAG, "");
 }
