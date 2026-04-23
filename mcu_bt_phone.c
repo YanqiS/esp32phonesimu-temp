@@ -416,6 +416,38 @@ static void start_sntp_if_needed(void)
     ESP_LOGI(TAG, "🕒 SNTP 已启动，等待时间同步");
 }
 
+static void configure_ap_dns_from_sta(void)
+{
+    if (!wifi_sta_netif || !wifi_ap_netif) return;
+
+    esp_netif_dns_info_t dns_main = {0};
+    esp_netif_dns_info_t dns_backup = {0};
+    esp_err_t r1 = esp_netif_get_dns_info(wifi_sta_netif, ESP_NETIF_DNS_MAIN, &dns_main);
+    esp_err_t r2 = esp_netif_get_dns_info(wifi_sta_netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
+
+    if (r1 == ESP_OK && dns_main.ip.type == ESP_IPADDR_TYPE_V4 &&
+        dns_main.ip.u_addr.ip4.addr != 0) {
+        esp_netif_set_dns_info(wifi_ap_netif, ESP_NETIF_DNS_MAIN, &dns_main);
+        ESP_LOGI(TAG, "📶 AP DNS(main) 跟随 STA: " IPSTR, IP2STR(&dns_main.ip.u_addr.ip4));
+    } else {
+        dns_main.ip.type = ESP_IPADDR_TYPE_V4;
+        dns_main.ip.u_addr.ip4.addr = ipaddr_addr("223.5.5.5");
+        esp_netif_set_dns_info(wifi_ap_netif, ESP_NETIF_DNS_MAIN, &dns_main);
+        ESP_LOGW(TAG, "⚠️ STA 主DNS不可用，AP DNS(main) 回退到 223.5.5.5");
+    }
+
+    if (r2 == ESP_OK && dns_backup.ip.type == ESP_IPADDR_TYPE_V4 &&
+        dns_backup.ip.u_addr.ip4.addr != 0) {
+        esp_netif_set_dns_info(wifi_ap_netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
+        ESP_LOGI(TAG, "📶 AP DNS(backup) 跟随 STA: " IPSTR, IP2STR(&dns_backup.ip.u_addr.ip4));
+    } else {
+        dns_backup.ip.type = ESP_IPADDR_TYPE_V4;
+        dns_backup.ip.u_addr.ip4.addr = ipaddr_addr("114.114.114.114");
+        esp_netif_set_dns_info(wifi_ap_netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
+        ESP_LOGW(TAG, "⚠️ STA 备DNS不可用，AP DNS(backup) 回退到 114.114.114.114");
+    }
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
@@ -428,6 +460,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Wi-Fi STA 已连上，IP=" IPSTR, IP2STR(&event->ip_info.ip));
+        configure_ap_dns_from_sta();
         start_sntp_if_needed();
 #if CONFIG_LWIP_IPV4_NAPT
         if (wifi_ap_netif) {
