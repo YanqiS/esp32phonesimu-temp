@@ -422,17 +422,20 @@ static void configure_ap_dns_from_sta(void)
 
     esp_netif_dns_info_t dns_main = {0};
     esp_netif_dns_info_t dns_backup = {0};
+    ip4_addr_t offer_dns = {0};
     esp_err_t r1 = esp_netif_get_dns_info(wifi_sta_netif, ESP_NETIF_DNS_MAIN, &dns_main);
     esp_err_t r2 = esp_netif_get_dns_info(wifi_sta_netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
 
     if (r1 == ESP_OK && dns_main.ip.type == ESP_IPADDR_TYPE_V4 &&
         dns_main.ip.u_addr.ip4.addr != 0) {
         esp_netif_set_dns_info(wifi_ap_netif, ESP_NETIF_DNS_MAIN, &dns_main);
+        offer_dns = dns_main.ip.u_addr.ip4;
         ESP_LOGI(TAG, "📶 AP DNS(main) 跟随 STA: " IPSTR, IP2STR(&dns_main.ip.u_addr.ip4));
     } else {
         dns_main.ip.type = ESP_IPADDR_TYPE_V4;
         dns_main.ip.u_addr.ip4.addr = ipaddr_addr("223.5.5.5");
         esp_netif_set_dns_info(wifi_ap_netif, ESP_NETIF_DNS_MAIN, &dns_main);
+        offer_dns = dns_main.ip.u_addr.ip4;
         ESP_LOGW(TAG, "⚠️ STA 主DNS不可用，AP DNS(main) 回退到 223.5.5.5");
     }
 
@@ -445,6 +448,24 @@ static void configure_ap_dns_from_sta(void)
         dns_backup.ip.u_addr.ip4.addr = ipaddr_addr("114.114.114.114");
         esp_netif_set_dns_info(wifi_ap_netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
         ESP_LOGW(TAG, "⚠️ STA 备DNS不可用，AP DNS(backup) 回退到 114.114.114.114");
+    }
+
+    // 通过 DHCP Option 6 显式下发 DNS，避免部分车机只认 DHCP 提供的 DNS
+    esp_err_t stop_ret = esp_netif_dhcps_stop(wifi_ap_netif);
+    if (stop_ret != ESP_OK && stop_ret != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        ESP_LOGW(TAG, "⚠️ 停止 AP DHCP Server 失败: %s", esp_err_to_name(stop_ret));
+    }
+    esp_err_t opt_ret = esp_netif_dhcps_option(wifi_ap_netif, ESP_NETIF_OP_SET,
+                                               ESP_NETIF_DOMAIN_NAME_SERVER,
+                                               &offer_dns, sizeof(offer_dns));
+    if (opt_ret != ESP_OK) {
+        ESP_LOGW(TAG, "⚠️ 设置 DHCP DNS Option 失败: %s", esp_err_to_name(opt_ret));
+    } else {
+        ESP_LOGI(TAG, "📶 DHCP DNS Option 已设置: " IPSTR, IP2STR(&offer_dns));
+    }
+    esp_err_t start_ret = esp_netif_dhcps_start(wifi_ap_netif);
+    if (start_ret != ESP_OK && start_ret != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+        ESP_LOGW(TAG, "⚠️ 启动 AP DHCP Server 失败: %s", esp_err_to_name(start_ret));
     }
 }
 
