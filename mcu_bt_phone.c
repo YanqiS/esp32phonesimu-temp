@@ -1020,7 +1020,7 @@ static int build_phonebook_vcards(char *buf, int max_len)
             "VERSION:2.1\r\n"
             "N;CHARSET=UTF-8:%s;;;;\r\n"
             "FN;CHARSET=UTF-8:%s\r\n"
-            "TEL;CELL:%s\r\n"
+            "TEL;TYPE=CELL:%s\r\n"
             "END:VCARD\r\n",
             phonebook[i].name, phonebook[i].name, phonebook[i].number);
         if (n < 0 || off + n >= max_len) break;
@@ -1147,6 +1147,7 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
     bool want_listing = false;
     uint16_t max_list_count = 0xFFFF;  // 默认：全部下载
     bool has_max_list_count = false;
+    uint8_t requested_format = 0x00;
 
     // ===== 解析所有 OBEX headers =====
     while (pos + 1 <= len) {
@@ -1186,6 +1187,10 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
                         has_max_list_count = true;
                         ESP_LOGI(TAG, "📒 GET MaxListCount=%d", max_list_count);
                     }
+                    if (tag == 0x07 && tlen == 1) {  // Format
+                        requested_format = data[ap + 2];
+                        ESP_LOGI(TAG, "📒 GET Format=0x%02X", requested_format);
+                    }
                     ap += 2 + tlen;
                 }
             }
@@ -1217,16 +1222,22 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
         if (!vcards) { obex_send(handle, 0xD3, NULL, 0); return; }
         int vlen = build_phonebook_vcards(vcards, 2048);
 
-        // 构建响应：App Params + End-of-Body
+        // 构建响应：Type + App Params + End-of-Body（部分车机需要 Type 才会入库）
+        const char *mime = (requested_format == 0x01) ? "x-bt/phonebook;version=3.0" : "x-bt/phonebook;version=2.1";
+        uint16_t type_hdr_len = (uint16_t)(3 + strlen(mime) + 1);  // 含 '\0'
         uint8_t app_params[16];
         int ap_len = build_app_params_response(app_params, pb_count);
 
         uint16_t eob_hdr_len = 3 + vlen;  // End-of-Body: id(1)+len(2)+data
-        uint16_t payload_len = ap_len + eob_hdr_len;
+        uint16_t payload_len = type_hdr_len + ap_len + eob_hdr_len;
         uint8_t *payload = malloc(payload_len);
         if (!payload) { free(vcards); obex_send(handle, 0xD3, NULL, 0); return; }
 
         int p = 0;
+        payload[p++] = 0x42;  // Type
+        payload[p++] = (type_hdr_len >> 8) & 0xFF;
+        payload[p++] = type_hdr_len & 0xFF;
+        memcpy(payload + p, mime, strlen(mime) + 1); p += (int)strlen(mime) + 1;
         memcpy(payload + p, app_params, ap_len); p += ap_len;
         payload[p++] = 0x49;  // End of Body
         payload[p++] = (eob_hdr_len >> 8) & 0xFF;
