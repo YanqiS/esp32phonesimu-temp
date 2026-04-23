@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -8,6 +9,10 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp_sntp.h"
+#include "lwip/inet.h"
 
 // Classic Bluetooth
 #include "esp_bt.h"
@@ -27,6 +32,17 @@
 #include "stack/sdp_api.h"
 
 #define TAG "BT_PHONE"
+
+// ========== Wi-Fi（STA连外网 + AP转发） ==========
+#define WIFI_STA_SSID      "YOUR_HOME_WIFI"
+#define WIFI_STA_PASS      "YOUR_HOME_PASS"
+#define WIFI_AP_SSID       "CarBridge_WIFI"
+#define WIFI_AP_PASS       "12345678"
+#define WIFI_AP_CHANNEL    6
+#define WIFI_MAX_STA_CONN  4
+#define WIFI_COUNTRY_CODE  "CN"
+// 关闭可显著降低蓝牙内存占用，减少 RFCOMM malloc failed 风险
+#define ENABLE_MEDIA_PROFILES 0
 
 // ========== 引脚定义 ==========
 // 左旋码（沿用 mcu1_led 配置）
@@ -57,6 +73,9 @@
 static char my_mac_id[8];
 static char bt_name[32];
 static bool bt_on = false;
+static esp_netif_t *wifi_sta_netif = NULL;
+static esp_netif_t *wifi_ap_netif  = NULL;
+static bool sntp_started = false;
 static int led_mode = 0;
 static bool a2dp_connected = false;
 static bool avrcp_connected = false;
@@ -96,12 +115,71 @@ typedef struct
     const char *number;
 } contact_t;
 
+typedef struct
+{
+    char name[32];
+    char number[32];
+    char datetime[20]; // UTC格式: YYYYMMDDTHHMMSS
+} calllog_t;
+
 static const contact_t phonebook[] = {
     {"张三", "13800138000"},
     {"李四", "13501693774"},
     {"王五", "13600136000"},
     {"赵六", "13700137000"},
 };
+
+enum { CALLLOG_MAX = 32 };
+
+static calllog_t incoming_calls[CALLLOG_MAX] = {
+};
+static size_t incoming_call_count = 0;
+
+static calllog_t outgoing_calls[CALLLOG_MAX] = {
+};
+static size_t outgoing_call_count = 0;
+
+static calllog_t missed_calls[CALLLOG_MAX] = {
+};
+static size_t missed_call_count = 0;
+
+static void pbap_get_datetime(char *out, size_t len)
+{
+    time_t now = time(NULL);
+    // 部分板子未配置SNTP/RTC时会返回1970，车机可能直接忽略该时间
+    // 回退到一个递增的伪时间，保证字段可被车机识别显示
+    static time_t pseudo_now = 1767225600; // 2026-01-01T00:00:00Z
+    if (now < 1700000000) { // < 2023-11-14 视为无效系统时钟
+        now = pseudo_now++;
+    }
+    struct tm tm_buf;
+    struct tm *ptm = gmtime_r(&now, &tm_buf);
+    if (ptm == NULL) {
+        strlcpy(out, "20260101T000000", len);
+        return;
+    }
+    strftime(out, len, "%Y%m%dT%H%M%S", ptm);
+}
+
+static void pbap_append_calllog(calllog_t *logs, size_t *count,
+                                const char *name, const char *number)
+{
+    if (!logs || !count || !number || number[0] == '\0') return;
+    size_t idx = *count;
+    if (idx >= CALLLOG_MAX) {
+        memmove(&logs[0], &logs[1], sizeof(calllog_t) * (CALLLOG_MAX - 1));
+        idx = CALLLOG_MAX - 1;
+        *count = CALLLOG_MAX;
+    } else {
+        *count = idx + 1;
+    }
+
+    calllog_t *it = &logs[idx];
+    memset(it, 0, sizeof(*it));
+    strlcpy(it->name, (name && name[0]) ? name : "未知号码", sizeof(it->name));
+    strlcpy(it->number, number, sizeof(it->number));
+    pbap_get_datetime(it->datetime, sizeof(it->datetime));
+}
 
 static const char *lookup_contact_name(const char *number)
 {
@@ -327,6 +405,160 @@ static esp_err_t start_bt_phone(void)
     ESP_LOGE(TAG, "✗ 蓝牙启动失败: %s", esp_err_to_name(ret));
     led_mode = 5; // 红灯快闪
     return ret;
+}
+
+static void start_sntp_if_needed(void)
+{
+    if (sntp_started) return;
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "ntp.aliyun.com");
+    esp_sntp_init();
+    sntp_started = true;
+    ESP_LOGI(TAG, "🕒 SNTP 已启动，等待时间同步");
+}
+
+static void configure_ap_dns_from_sta(void)
+{
+    if (!wifi_sta_netif || !wifi_ap_netif) return;
+
+    esp_netif_dns_info_t dns_main = {0};
+    esp_netif_dns_info_t dns_backup = {0};
+    uint32_t offer_dns_addr = 0;
+    esp_err_t r1 = esp_netif_get_dns_info(wifi_sta_netif, ESP_NETIF_DNS_MAIN, &dns_main);
+    esp_err_t r2 = esp_netif_get_dns_info(wifi_sta_netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
+
+    if (r1 == ESP_OK && dns_main.ip.type == ESP_IPADDR_TYPE_V4 &&
+        dns_main.ip.u_addr.ip4.addr != 0) {
+        esp_netif_set_dns_info(wifi_ap_netif, ESP_NETIF_DNS_MAIN, &dns_main);
+        offer_dns_addr = dns_main.ip.u_addr.ip4.addr;
+        ESP_LOGI(TAG, "📶 AP DNS(main) 跟随 STA: " IPSTR, IP2STR(&dns_main.ip.u_addr.ip4));
+    } else {
+        dns_main.ip.type = ESP_IPADDR_TYPE_V4;
+        dns_main.ip.u_addr.ip4.addr = ipaddr_addr("223.5.5.5");
+        esp_netif_set_dns_info(wifi_ap_netif, ESP_NETIF_DNS_MAIN, &dns_main);
+        offer_dns_addr = dns_main.ip.u_addr.ip4.addr;
+        ESP_LOGW(TAG, "⚠️ STA 主DNS不可用，AP DNS(main) 回退到 223.5.5.5");
+    }
+
+    if (r2 == ESP_OK && dns_backup.ip.type == ESP_IPADDR_TYPE_V4 &&
+        dns_backup.ip.u_addr.ip4.addr != 0) {
+        esp_netif_set_dns_info(wifi_ap_netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
+        ESP_LOGI(TAG, "📶 AP DNS(backup) 跟随 STA: " IPSTR, IP2STR(&dns_backup.ip.u_addr.ip4));
+    } else {
+        dns_backup.ip.type = ESP_IPADDR_TYPE_V4;
+        dns_backup.ip.u_addr.ip4.addr = ipaddr_addr("114.114.114.114");
+        esp_netif_set_dns_info(wifi_ap_netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
+        ESP_LOGW(TAG, "⚠️ STA 备DNS不可用，AP DNS(backup) 回退到 114.114.114.114");
+    }
+
+    // 通过 DHCP Option 6 显式下发 DNS，避免部分车机只认 DHCP 提供的 DNS
+    esp_err_t stop_ret = esp_netif_dhcps_stop(wifi_ap_netif);
+    if (stop_ret != ESP_OK && stop_ret != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        ESP_LOGW(TAG, "⚠️ 停止 AP DHCP Server 失败: %s", esp_err_to_name(stop_ret));
+    }
+    esp_netif_dns_info_t offer_dns = {0};
+    offer_dns.ip.type = ESP_IPADDR_TYPE_V4;
+    offer_dns.ip.u_addr.ip4.addr = offer_dns_addr;
+    esp_err_t opt_ret = esp_netif_dhcps_option(wifi_ap_netif, ESP_NETIF_OP_SET,
+                                               ESP_NETIF_DOMAIN_NAME_SERVER,
+                                               &offer_dns, sizeof(offer_dns));
+    if (opt_ret != ESP_OK) {
+        ESP_LOGW(TAG, "⚠️ 设置 DHCP DNS Option 失败: %s", esp_err_to_name(opt_ret));
+    } else {
+        ESP_LOGI(TAG, "📶 DHCP DNS Option 已设置: " IPSTR, IP2STR(&offer_dns.ip.u_addr.ip4));
+    }
+    esp_err_t start_ret = esp_netif_dhcps_start(wifi_ap_netif);
+    if (start_ret != ESP_OK && start_ret != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+        ESP_LOGW(TAG, "⚠️ 启动 AP DHCP Server 失败: %s", esp_err_to_name(start_ret));
+    }
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "Wi-Fi STA 断开，reason=%d，尝试重连", disc ? disc->reason : -1);
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Wi-Fi STA 已连上，IP=" IPSTR, IP2STR(&event->ip_info.ip));
+        configure_ap_dns_from_sta();
+        start_sntp_if_needed();
+#if CONFIG_LWIP_IPV4_NAPT
+        if (wifi_ap_netif) {
+            esp_err_t napt_ret = esp_netif_napt_enable(wifi_ap_netif);
+            if (napt_ret == ESP_OK || napt_ret == ESP_ERR_INVALID_STATE) {
+                ESP_LOGI(TAG, "📶 AP NAT 已开启（可通过 %s 共享上网）", WIFI_AP_SSID);
+            } else {
+                ESP_LOGW(TAG, "⚠️ AP NAT 开启失败: %s", esp_err_to_name(napt_ret));
+            }
+        }
+#else
+        ESP_LOGW(TAG, "⚠️ 未启用 CONFIG_LWIP_IPV4_NAPT，AP 客户端可能显示“网络不可用”");
+#endif
+    }
+}
+
+static esp_err_t wifi_init_sta_ap(void)
+{
+    esp_err_t ret = esp_netif_init();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) return ret;
+    ret = esp_event_loop_create_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) return ret;
+
+    wifi_sta_netif = esp_netif_create_default_wifi_sta();
+    wifi_ap_netif  = esp_netif_create_default_wifi_ap();
+    if (!wifi_sta_netif || !wifi_ap_netif) {
+        return ESP_FAIL;
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    wifi_config_t sta_cfg = {0};
+    strlcpy((char *)sta_cfg.sta.ssid, WIFI_STA_SSID, sizeof(sta_cfg.sta.ssid));
+    strlcpy((char *)sta_cfg.sta.password, WIFI_STA_PASS, sizeof(sta_cfg.sta.password));
+    // 放宽到 WPA，兼容 WPA/WPA2/WPA3 混合网络，避免因阈值过高导致拒连
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
+    sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    sta_cfg.sta.pmf_cfg.capable = true;
+    sta_cfg.sta.pmf_cfg.required = false;
+
+    wifi_config_t ap_cfg = {0};
+    strlcpy((char *)ap_cfg.ap.ssid, WIFI_AP_SSID, sizeof(ap_cfg.ap.ssid));
+    strlcpy((char *)ap_cfg.ap.password, WIFI_AP_PASS, sizeof(ap_cfg.ap.password));
+    ap_cfg.ap.ssid_len = strlen(WIFI_AP_SSID);
+    ap_cfg.ap.channel = WIFI_AP_CHANNEL;
+    ap_cfg.ap.max_connection = WIFI_MAX_STA_CONN;
+    ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    if (strlen(WIFI_AP_PASS) == 0) ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    esp_err_t ctry_ret = esp_wifi_set_country_code(WIFI_COUNTRY_CODE, true);
+    if (ctry_ret != ESP_OK) {
+        ESP_LOGW(TAG, "⚠️ 设置国家码失败: %s", esp_err_to_name(ctry_ret));
+    }
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    if (strcmp(WIFI_STA_SSID, "YOUR_HOME_WIFI") == 0) {
+        ESP_LOGW(TAG, "⚠️ 你还没改 WIFI_STA_SSID/WIFI_STA_PASS，当前一定会连不上");
+    }
+    ESP_ERROR_CHECK(esp_wifi_start());
+    // 关闭省电，优先保证首次连网稳定性和流媒体实时性（音乐App更敏感）
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    ESP_LOGI(TAG, "📶 Wi-Fi AP+STA 已启动");
+    ESP_LOGI(TAG, "📶 STA 连接: ssid=%s", WIFI_STA_SSID);
+    ESP_LOGI(TAG, "📶 AP 热点: ssid=%s pass=%s", WIFI_AP_SSID, WIFI_AP_PASS);
+    return ESP_OK;
 }
 
 static void a2dp_source_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
@@ -597,6 +829,9 @@ void handle_call_reject(void)
     ESP_LOGI(TAG, "❌ 电话号码: %s", current_phone_number);
     ESP_LOGI(TAG, "❌ ===============================");
 
+    const char *name = lookup_contact_name(current_phone_number);
+    pbap_append_calllog(missed_calls, &missed_call_count, name, current_phone_number);
+
     // // 停止RING
     // if (ring_timer != NULL)
     // {
@@ -643,6 +878,13 @@ void handle_call_hangup(void)
         ESP_LOGI(TAG, "📴 联系人: %s", name);
     }
     ESP_LOGI(TAG, "📴 ===============================");
+
+    // 通话结束后写入通话记录：来电通话→ICH，外拨通话→OCH
+    if (current_call_direction == CALL_DIR_INCOMING) {
+        pbap_append_calllog(incoming_calls, &incoming_call_count, name, current_phone_number);
+    } else {
+        pbap_append_calllog(outgoing_calls, &outgoing_call_count, name, current_phone_number);
+    }
 
     current_call_state = CALL_STATE_IDLE;
     led_mode = 2; // 绿灯常亮
@@ -802,6 +1044,8 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         else if (current_call_state == CALL_STATE_DIALING ||
                  current_call_state == CALL_STATE_ALERTING)
         {
+            const char *name = lookup_contact_name(current_phone_number);
+            pbap_append_calllog(outgoing_calls, &outgoing_call_count, name, current_phone_number);
             current_call_state = CALL_STATE_IDLE;
             led_mode = 2;
             esp_hf_ag_end_call(connected_device, 0, 0,
@@ -1010,23 +1254,101 @@ static void pbap_tx_timer_cb(TimerHandle_t xTimer)
     }
 }
 
-// 生成全部联系人的 vCard 2.1 数据
-static int build_phonebook_vcards(char *buf, int max_len)
+// 生成全部联系人的 vCard 数据（format: 0x00=v2.1, 0x01=v3.0）
+static int build_phonebook_vcards(char *buf, int max_len, uint8_t format)
 {
     int off = 0;
+    bool use_vcard30 = (format == 0x01);
     for (size_t i = 0; i < sizeof(phonebook)/sizeof(phonebook[0]); i++) {
-        int n = snprintf(buf + off, max_len - off,
-            "BEGIN:VCARD\r\n"
-            "VERSION:2.1\r\n"
-            "N;CHARSET=UTF-8:%s;;;;\r\n"
-            "FN;CHARSET=UTF-8:%s\r\n"
-            "TEL;CELL:%s\r\n"
-            "END:VCARD\r\n",
-            phonebook[i].name, phonebook[i].name, phonebook[i].number);
+        int n = 0;
+        if (use_vcard30) {
+            // vCard 3.0 默认 UTF-8，避免携带部分车机不兼容的 CHARSET 参数
+            n = snprintf(buf + off, max_len - off,
+                "BEGIN:VCARD\r\n"
+                "VERSION:3.0\r\n"
+                "N:%s;;;;\r\n"
+                "FN:%s\r\n"
+                "TEL;TYPE=CELL:%s\r\n"
+                "END:VCARD\r\n",
+                phonebook[i].name, phonebook[i].name, phonebook[i].number);
+        } else {
+            n = snprintf(buf + off, max_len - off,
+                "BEGIN:VCARD\r\n"
+                "VERSION:2.1\r\n"
+                "N;CHARSET=UTF-8:%s;;;;\r\n"
+                "FN;CHARSET=UTF-8:%s\r\n"
+                "TEL;TYPE=CELL:%s\r\n"
+                "END:VCARD\r\n",
+                phonebook[i].name, phonebook[i].name, phonebook[i].number);
+        }
         if (n < 0 || off + n >= max_len) break;
         off += n;
     }
     return off;
+}
+
+static int build_calllog_vcards(char *buf, int max_len, uint8_t format,
+                                const calllog_t *logs, size_t log_count,
+                                const char *call_type)
+{
+    int off = 0;
+    bool use_vcard30 = (format == 0x01);
+    for (size_t i = 0; i < log_count; i++) {
+        int n = 0;
+        if (use_vcard30) {
+            n = snprintf(buf + off, max_len - off,
+                "BEGIN:VCARD\r\n"
+                "VERSION:3.0\r\n"
+                "N:%s;;;;\r\n"
+                "FN:%s\r\n"
+                "TEL;TYPE=CELL:%s\r\n"
+                "X-IRMC-CALL-DATETIME:%s\r\n"
+                "X-IRMC-CALL-DATETIME;TYPE=%s:%s\r\n"
+                "END:VCARD\r\n",
+                logs[i].name, logs[i].name, logs[i].number,
+                logs[i].datetime, call_type, logs[i].datetime);
+        } else {
+            n = snprintf(buf + off, max_len - off,
+                "BEGIN:VCARD\r\n"
+                "VERSION:2.1\r\n"
+                "N;CHARSET=UTF-8:%s;;;;\r\n"
+                "FN;CHARSET=UTF-8:%s\r\n"
+                "TEL;TYPE=CELL:%s\r\n"
+                "X-IRMC-CALL-DATETIME:%s\r\n"
+                "X-IRMC-CALL-DATETIME;TYPE=%s:%s\r\n"
+                "END:VCARD\r\n",
+                logs[i].name, logs[i].name, logs[i].number,
+                logs[i].datetime, call_type, logs[i].datetime);
+        }
+        if (n < 0 || off + n >= max_len) break;
+        off += n;
+    }
+    return off;
+}
+
+typedef enum {
+    PB_OBJ_PHONEBOOK = 0,
+    PB_OBJ_ICH,
+    PB_OBJ_OCH,
+    PB_OBJ_MCH,
+    PB_OBJ_CCH,
+} pb_object_t;
+
+static bool utf16be_contains_ascii(const uint8_t *buf, uint16_t start, uint16_t end, const char *token)
+{
+    size_t tlen = strlen(token);
+    if (tlen == 0) return false;
+    for (uint16_t k = start; (uint32_t)k + (uint32_t)(tlen * 2) <= end; k += 2) {
+        bool match = true;
+        for (size_t i = 0; i < tlen; i++) {
+            if (buf[k + i * 2] != 0 || buf[k + i * 2 + 1] != (uint8_t)token[i]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
 }
 
 // 生成 vCard-listing XML（车机浏览联系人列表时请求）
@@ -1147,6 +1469,8 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
     bool want_listing = false;
     uint16_t max_list_count = 0xFFFF;  // 默认：全部下载
     bool has_max_list_count = false;
+    uint8_t requested_format = 0x00;
+    pb_object_t requested_obj = PB_OBJ_PHONEBOOK;
 
     // ===== 解析所有 OBEX headers =====
     while (pos + 1 <= len) {
@@ -1166,12 +1490,15 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
                 if (strstr(t, "x-bt/vcard"))         want_phonebook = true;
             }
             else if (hid == 0x01) {  // Name header (UTF-16BE)
-                for (uint16_t k = pos + 3; k + 3 < pos + hlen; k += 2) {
-                    if (data[k]==0 && data[k+1]=='p' && data[k+2]==0 && data[k+3]=='b') {
-                        want_phonebook = true;
-                        break;
-                    }
-                }
+                uint16_t nstart = pos + 3;
+                uint16_t nend = pos + hlen;
+                if (utf16be_contains_ascii(data, nstart, nend, "ich")) requested_obj = PB_OBJ_ICH;
+                else if (utf16be_contains_ascii(data, nstart, nend, "och")) requested_obj = PB_OBJ_OCH;
+                else if (utf16be_contains_ascii(data, nstart, nend, "mch")) requested_obj = PB_OBJ_MCH;
+                else if (utf16be_contains_ascii(data, nstart, nend, "cch")) requested_obj = PB_OBJ_CCH;
+                else if (utf16be_contains_ascii(data, nstart, nend, "pb"))  requested_obj = PB_OBJ_PHONEBOOK;
+
+                want_phonebook = true;
             }
             else if (hid == 0x4C) {  // Application Parameters
                 // 解析 tag-length-value
@@ -1185,6 +1512,10 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
                         max_list_count = (data[ap+2] << 8) | data[ap+3];
                         has_max_list_count = true;
                         ESP_LOGI(TAG, "📒 GET MaxListCount=%d", max_list_count);
+                    }
+                    if (tag == 0x07 && tlen == 1) {  // Format
+                        requested_format = data[ap + 2];
+                        ESP_LOGI(TAG, "📒 GET Format=0x%02X", requested_format);
                     }
                     ap += 2 + tlen;
                 }
@@ -1200,7 +1531,47 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
         want_phonebook = true;
     }
 
-    uint16_t pb_count = (uint16_t)(sizeof(phonebook) / sizeof(phonebook[0]));
+    const calllog_t *selected_logs = NULL;
+    size_t selected_log_count = 0;
+    const char *obj_label = "pb";
+    const char *selected_call_type = "DIALED";
+    switch (requested_obj) {
+        case PB_OBJ_ICH:
+            selected_logs = incoming_calls;
+            selected_log_count = incoming_call_count;
+            obj_label = "ich";
+            selected_call_type = "RECEIVED";
+            break;
+        case PB_OBJ_OCH:
+            selected_logs = outgoing_calls;
+            selected_log_count = outgoing_call_count;
+            obj_label = "och";
+            selected_call_type = "DIALED";
+            break;
+        case PB_OBJ_MCH:
+            selected_logs = missed_calls;
+            selected_log_count = missed_call_count;
+            obj_label = "mch";
+            selected_call_type = "MISSED";
+            break;
+        case PB_OBJ_CCH:
+            obj_label = "cch";
+            break;
+        case PB_OBJ_PHONEBOOK:
+        default:
+            obj_label = "pb";
+            break;
+    }
+
+    uint16_t pb_count = 0;
+    if (requested_obj == PB_OBJ_PHONEBOOK) {
+        pb_count = (uint16_t)(sizeof(phonebook) / sizeof(phonebook[0]));
+    } else if (requested_obj == PB_OBJ_CCH) {
+        pb_count = (uint16_t)(incoming_call_count + outgoing_call_count + missed_call_count);
+    } else {
+        pb_count = (uint16_t)selected_log_count;
+    }
+    ESP_LOGI(TAG, "📒 PBAP 请求对象: %s", obj_label);
 
     // ===== MaxListCount == 0：车机只想知道有多少条，不要数据 =====
     if (has_max_list_count && max_list_count == 0) {
@@ -1215,18 +1586,39 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
     if (want_phonebook) {
         char *vcards = malloc(2048);
         if (!vcards) { obex_send(handle, 0xD3, NULL, 0); return; }
-        int vlen = build_phonebook_vcards(vcards, 2048);
+        int vlen = 0;
+        if (requested_obj == PB_OBJ_PHONEBOOK) {
+            vlen = build_phonebook_vcards(vcards, 2048, requested_format);
+        } else if (requested_obj == PB_OBJ_CCH) {
+            int off = 0;
+            off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
+                                        incoming_calls, incoming_call_count, "RECEIVED");
+            off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
+                                        outgoing_calls, outgoing_call_count, "DIALED");
+            off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
+                                        missed_calls, missed_call_count, "MISSED");
+            vlen = off;
+        } else {
+            vlen = build_calllog_vcards(vcards, 2048, requested_format,
+                                        selected_logs, selected_log_count, selected_call_type);
+        }
 
-        // 构建响应：App Params + End-of-Body
+        // 构建响应：Type + App Params + End-of-Body（部分车机需要 Type 才会入库）
+        const char *mime = (requested_format == 0x01) ? "x-bt/phonebook;version=3.0" : "x-bt/phonebook;version=2.1";
+        uint16_t type_hdr_len = (uint16_t)(3 + strlen(mime) + 1);  // 含 '\0'
         uint8_t app_params[16];
         int ap_len = build_app_params_response(app_params, pb_count);
 
         uint16_t eob_hdr_len = 3 + vlen;  // End-of-Body: id(1)+len(2)+data
-        uint16_t payload_len = ap_len + eob_hdr_len;
+        uint16_t payload_len = type_hdr_len + ap_len + eob_hdr_len;
         uint8_t *payload = malloc(payload_len);
         if (!payload) { free(vcards); obex_send(handle, 0xD3, NULL, 0); return; }
 
         int p = 0;
+        payload[p++] = 0x42;  // Type
+        payload[p++] = (type_hdr_len >> 8) & 0xFF;
+        payload[p++] = type_hdr_len & 0xFF;
+        memcpy(payload + p, mime, strlen(mime) + 1); p += (int)strlen(mime) + 1;
         memcpy(payload + p, app_params, ap_len); p += ap_len;
         payload[p++] = 0x49;  // End of Body
         payload[p++] = (eob_hdr_len >> 8) & 0xFF;
@@ -1236,7 +1628,8 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
         obex_send(handle, 0xA0, payload, p);
         free(payload);
         free(vcards);
-        ESP_LOGI(TAG, "📒 PBAP 发送通讯录 (%d bytes, %d 联系人)", vlen, pb_count);
+        ESP_LOGI(TAG, "📒 PBAP 发送对象=%s (%d bytes, %d 条, vCard %s)",
+                 obj_label, vlen, pb_count, requested_format == 0x01 ? "3.0" : "2.1");
     } else if (want_listing) {
         char *listing = malloc(1024);
         if (!listing) { obex_send(handle, 0xD3, NULL, 0); return; }
@@ -1454,6 +1847,7 @@ static esp_err_t bt_init(void)
         goto fail;
     }
 
+#if ENABLE_MEDIA_PROFILES
     // 车机通常会把“手机”当作 A2DP Source + AVRCP Target + HFP AG 的组合设备看待。
     // 仅暴露 HFP AG 时，部分车机会因为缺少 AVDTP(PSM 25) 服务而主动断开。
     ret = esp_avrc_tg_init();
@@ -1473,6 +1867,9 @@ static esp_err_t bt_init(void)
         goto fail;
     }
     a2dp_inited = true;
+#else
+    ESP_LOGW(TAG, "⚠️ 已关闭 A2DP/AVRCP 以节省内存（ENABLE_MEDIA_PROFILES=0）");
+#endif
 
     // 初始化HFP AG
     ret = esp_hf_ag_register_callback(hfp_ag_callback);
@@ -1532,8 +1929,10 @@ static void bt_deinit(void)
 
     // 关闭HFP AG
     esp_hf_ag_deinit();
+#if ENABLE_MEDIA_PROFILES
     esp_a2d_source_deinit();
     esp_avrc_tg_deinit();
+#endif
 
     // 关闭Bluedroid
     esp_bluedroid_disable();
@@ -1803,6 +2202,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    esp_err_t ret_wifi = wifi_init_sta_ap();
+    if (ret_wifi != ESP_OK)
+    {
+        ESP_LOGW(TAG, "⚠️ Wi-Fi AP+STA 初始化失败: %s", esp_err_to_name(ret_wifi));
+    }
+
     // 读取MAC地址生成唯一标识
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -1876,6 +2281,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "💡 系统就绪");
     ESP_LOGI(TAG, "💡 上电后会自动启动蓝牙，BOOT键可手动重启");
+    ESP_LOGI(TAG, "💡 同时启动Wi-Fi：连接家庭网络并广播热点 %s", WIFI_AP_SSID);
     ESP_LOGI(TAG, "💡 按CALL键 (GPIO23) 模拟来电");
     ESP_LOGI(TAG, "💡 旋钮1: 1→0呼出13800138000, 2→0呼出13501693774, 3→0呼出13600136000");
     ESP_LOGI(TAG, "💡 旋钮2: 1→0模拟来电, 2→0接通, 3→0挂断/拒接");
