@@ -434,6 +434,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             esp_netif_napt_enable(wifi_ap_netif);
             ESP_LOGI(TAG, "📶 AP NAT 已开启（可通过 %s 共享上网）", WIFI_AP_SSID);
         }
+#else
+        ESP_LOGW(TAG, "⚠️ 当前固件未开启 NAPT，AP 客户端可能显示“网络不可用”");
 #endif
     }
 }
