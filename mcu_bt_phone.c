@@ -421,7 +421,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Wi-Fi STA 断开，尝试重连");
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "Wi-Fi STA 断开，reason=%d，尝试重连", disc ? disc->reason : -1);
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
@@ -458,7 +459,8 @@ static esp_err_t wifi_init_sta_ap(void)
     wifi_config_t sta_cfg = {0};
     strlcpy((char *)sta_cfg.sta.ssid, WIFI_STA_SSID, sizeof(sta_cfg.sta.ssid));
     strlcpy((char *)sta_cfg.sta.password, WIFI_STA_PASS, sizeof(sta_cfg.sta.password));
-    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    // 放宽到 WPA，兼容 WPA/WPA2/WPA3 混合网络，避免因阈值过高导致拒连
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
     sta_cfg.sta.pmf_cfg.capable = true;
     sta_cfg.sta.pmf_cfg.required = false;
 
@@ -474,6 +476,9 @@ static esp_err_t wifi_init_sta_ap(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    if (strcmp(WIFI_STA_SSID, "YOUR_HOME_WIFI") == 0) {
+        ESP_LOGW(TAG, "⚠️ 你还没改 WIFI_STA_SSID/WIFI_STA_PASS，当前一定会连不上");
+    }
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "📶 Wi-Fi AP+STA 已启动");
