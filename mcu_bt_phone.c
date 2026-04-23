@@ -429,13 +429,17 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Wi-Fi STA 已连上，IP=" IPSTR, IP2STR(&event->ip_info.ip));
         start_sntp_if_needed();
-#ifdef ESP_NETIF_NAPT_SUPPORTED
+#if CONFIG_LWIP_IPV4_NAPT
         if (wifi_ap_netif) {
-            esp_netif_napt_enable(wifi_ap_netif);
-            ESP_LOGI(TAG, "📶 AP NAT 已开启（可通过 %s 共享上网）", WIFI_AP_SSID);
+            esp_err_t napt_ret = esp_netif_napt_enable(wifi_ap_netif);
+            if (napt_ret == ESP_OK || napt_ret == ESP_ERR_INVALID_STATE) {
+                ESP_LOGI(TAG, "📶 AP NAT 已开启（可通过 %s 共享上网）", WIFI_AP_SSID);
+            } else {
+                ESP_LOGW(TAG, "⚠️ AP NAT 开启失败: %s", esp_err_to_name(napt_ret));
+            }
         }
 #else
-        ESP_LOGW(TAG, "⚠️ 当前固件未开启 NAPT，AP 客户端可能显示“网络不可用”");
+        ESP_LOGW(TAG, "⚠️ 未启用 CONFIG_LWIP_IPV4_NAPT，AP 客户端可能显示“网络不可用”");
 #endif
     }
 }
