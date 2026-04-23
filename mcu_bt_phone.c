@@ -41,6 +41,8 @@
 #define WIFI_AP_CHANNEL    6
 #define WIFI_MAX_STA_CONN  4
 #define WIFI_COUNTRY_CODE  "CN"
+// 关闭可显著降低蓝牙内存占用，减少 RFCOMM malloc failed 风险
+#define ENABLE_MEDIA_PROFILES 0
 
 // ========== 引脚定义 ==========
 // 左旋码（沿用 mcu1_led 配置）
@@ -1845,6 +1847,7 @@ static esp_err_t bt_init(void)
         goto fail;
     }
 
+#if ENABLE_MEDIA_PROFILES
     // 车机通常会把“手机”当作 A2DP Source + AVRCP Target + HFP AG 的组合设备看待。
     // 仅暴露 HFP AG 时，部分车机会因为缺少 AVDTP(PSM 25) 服务而主动断开。
     ret = esp_avrc_tg_init();
@@ -1864,6 +1867,9 @@ static esp_err_t bt_init(void)
         goto fail;
     }
     a2dp_inited = true;
+#else
+    ESP_LOGW(TAG, "⚠️ 已关闭 A2DP/AVRCP 以节省内存（ENABLE_MEDIA_PROFILES=0）");
+#endif
 
     // 初始化HFP AG
     ret = esp_hf_ag_register_callback(hfp_ag_callback);
@@ -1923,8 +1929,10 @@ static void bt_deinit(void)
 
     // 关闭HFP AG
     esp_hf_ag_deinit();
+#if ENABLE_MEDIA_PROFILES
     esp_a2d_source_deinit();
     esp_avrc_tg_deinit();
+#endif
 
     // 关闭Bluedroid
     esp_bluedroid_disable();
