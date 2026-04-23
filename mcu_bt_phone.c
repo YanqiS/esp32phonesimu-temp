@@ -9,6 +9,10 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp_sntp.h"
+#include "lwip/inet.h"
 
 // Classic Bluetooth
 #include "esp_bt.h"
@@ -28,6 +32,14 @@
 #include "stack/sdp_api.h"
 
 #define TAG "BT_PHONE"
+
+// ========== Wi-Fi（STA连外网 + AP转发） ==========
+#define WIFI_STA_SSID      "YOUR_HOME_WIFI"
+#define WIFI_STA_PASS      "YOUR_HOME_PASS"
+#define WIFI_AP_SSID       "CarBridge_WIFI"
+#define WIFI_AP_PASS       "12345678"
+#define WIFI_AP_CHANNEL    6
+#define WIFI_MAX_STA_CONN  4
 
 // ========== 引脚定义 ==========
 // 左旋码（沿用 mcu1_led 配置）
@@ -58,6 +70,9 @@
 static char my_mac_id[8];
 static char bt_name[32];
 static bool bt_on = false;
+static esp_netif_t *wifi_sta_netif = NULL;
+static esp_netif_t *wifi_ap_netif  = NULL;
+static bool sntp_started = false;
 static int led_mode = 0;
 static bool a2dp_connected = false;
 static bool avrcp_connected = false;
@@ -387,6 +402,84 @@ static esp_err_t start_bt_phone(void)
     ESP_LOGE(TAG, "✗ 蓝牙启动失败: %s", esp_err_to_name(ret));
     led_mode = 5; // 红灯快闪
     return ret;
+}
+
+static void start_sntp_if_needed(void)
+{
+    if (sntp_started) return;
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_setservername(1, "ntp.aliyun.com");
+    sntp_init();
+    sntp_started = true;
+    ESP_LOGI(TAG, "🕒 SNTP 已启动，等待时间同步");
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Wi-Fi STA 断开，尝试重连");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Wi-Fi STA 已连上，IP=" IPSTR, IP2STR(&event->ip_info.ip));
+        start_sntp_if_needed();
+#ifdef ESP_NETIF_NAPT_SUPPORTED
+        if (wifi_ap_netif) {
+            esp_netif_napt_enable(wifi_ap_netif);
+            ESP_LOGI(TAG, "📶 AP NAT 已开启（可通过 %s 共享上网）", WIFI_AP_SSID);
+        }
+#endif
+    }
+}
+
+static esp_err_t wifi_init_sta_ap(void)
+{
+    esp_err_t ret = esp_netif_init();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) return ret;
+    ret = esp_event_loop_create_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) return ret;
+
+    wifi_sta_netif = esp_netif_create_default_wifi_sta();
+    wifi_ap_netif  = esp_netif_create_default_wifi_ap();
+    if (!wifi_sta_netif || !wifi_ap_netif) {
+        return ESP_FAIL;
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    wifi_config_t sta_cfg = {0};
+    strlcpy((char *)sta_cfg.sta.ssid, WIFI_STA_SSID, sizeof(sta_cfg.sta.ssid));
+    strlcpy((char *)sta_cfg.sta.password, WIFI_STA_PASS, sizeof(sta_cfg.sta.password));
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    sta_cfg.sta.pmf_cfg.capable = true;
+    sta_cfg.sta.pmf_cfg.required = false;
+
+    wifi_config_t ap_cfg = {0};
+    strlcpy((char *)ap_cfg.ap.ssid, WIFI_AP_SSID, sizeof(ap_cfg.ap.ssid));
+    strlcpy((char *)ap_cfg.ap.password, WIFI_AP_PASS, sizeof(ap_cfg.ap.password));
+    ap_cfg.ap.ssid_len = strlen(WIFI_AP_SSID);
+    ap_cfg.ap.channel = WIFI_AP_CHANNEL;
+    ap_cfg.ap.max_connection = WIFI_MAX_STA_CONN;
+    ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    if (strlen(WIFI_AP_PASS) == 0) ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "📶 Wi-Fi AP+STA 已启动");
+    ESP_LOGI(TAG, "📶 STA 连接: ssid=%s", WIFI_STA_SSID);
+    ESP_LOGI(TAG, "📶 AP 热点: ssid=%s pass=%s", WIFI_AP_SSID, WIFI_AP_PASS);
+    return ESP_OK;
 }
 
 static void a2dp_source_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
@@ -2024,6 +2117,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    esp_err_t ret_wifi = wifi_init_sta_ap();
+    if (ret_wifi != ESP_OK)
+    {
+        ESP_LOGW(TAG, "⚠️ Wi-Fi AP+STA 初始化失败: %s", esp_err_to_name(ret_wifi));
+    }
+
     // 读取MAC地址生成唯一标识
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -2097,6 +2196,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "💡 系统就绪");
     ESP_LOGI(TAG, "💡 上电后会自动启动蓝牙，BOOT键可手动重启");
+    ESP_LOGI(TAG, "💡 同时启动Wi-Fi：连接家庭网络并广播热点 %s", WIFI_AP_SSID);
     ESP_LOGI(TAG, "💡 按CALL键 (GPIO23) 模拟来电");
     ESP_LOGI(TAG, "💡 旋钮1: 1→0呼出13800138000, 2→0呼出13501693774, 3→0呼出13600136000");
     ESP_LOGI(TAG, "💡 旋钮2: 1→0模拟来电, 2→0接通, 3→0挂断/拒接");
