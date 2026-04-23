@@ -1010,19 +1010,33 @@ static void pbap_tx_timer_cb(TimerHandle_t xTimer)
     }
 }
 
-// 生成全部联系人的 vCard 2.1 数据
-static int build_phonebook_vcards(char *buf, int max_len)
+// 生成全部联系人的 vCard 数据（format: 0x00=v2.1, 0x01=v3.0）
+static int build_phonebook_vcards(char *buf, int max_len, uint8_t format)
 {
     int off = 0;
+    bool use_vcard30 = (format == 0x01);
     for (size_t i = 0; i < sizeof(phonebook)/sizeof(phonebook[0]); i++) {
-        int n = snprintf(buf + off, max_len - off,
-            "BEGIN:VCARD\r\n"
-            "VERSION:2.1\r\n"
-            "N;CHARSET=UTF-8:%s;;;;\r\n"
-            "FN;CHARSET=UTF-8:%s\r\n"
-            "TEL;TYPE=CELL:%s\r\n"
-            "END:VCARD\r\n",
-            phonebook[i].name, phonebook[i].name, phonebook[i].number);
+        int n = 0;
+        if (use_vcard30) {
+            // vCard 3.0 默认 UTF-8，避免携带部分车机不兼容的 CHARSET 参数
+            n = snprintf(buf + off, max_len - off,
+                "BEGIN:VCARD\r\n"
+                "VERSION:3.0\r\n"
+                "N:%s;;;;\r\n"
+                "FN:%s\r\n"
+                "TEL;TYPE=CELL:%s\r\n"
+                "END:VCARD\r\n",
+                phonebook[i].name, phonebook[i].name, phonebook[i].number);
+        } else {
+            n = snprintf(buf + off, max_len - off,
+                "BEGIN:VCARD\r\n"
+                "VERSION:2.1\r\n"
+                "N;CHARSET=UTF-8:%s;;;;\r\n"
+                "FN;CHARSET=UTF-8:%s\r\n"
+                "TEL;TYPE=CELL:%s\r\n"
+                "END:VCARD\r\n",
+                phonebook[i].name, phonebook[i].name, phonebook[i].number);
+        }
         if (n < 0 || off + n >= max_len) break;
         off += n;
     }
@@ -1220,7 +1234,7 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
     if (want_phonebook) {
         char *vcards = malloc(2048);
         if (!vcards) { obex_send(handle, 0xD3, NULL, 0); return; }
-        int vlen = build_phonebook_vcards(vcards, 2048);
+        int vlen = build_phonebook_vcards(vcards, 2048, requested_format);
 
         // 构建响应：Type + App Params + End-of-Body（部分车机需要 Type 才会入库）
         const char *mime = (requested_format == 0x01) ? "x-bt/phonebook;version=3.0" : "x-bt/phonebook;version=2.1";
@@ -1247,7 +1261,8 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
         obex_send(handle, 0xA0, payload, p);
         free(payload);
         free(vcards);
-        ESP_LOGI(TAG, "📒 PBAP 发送通讯录 (%d bytes, %d 联系人)", vlen, pb_count);
+        ESP_LOGI(TAG, "📒 PBAP 发送通讯录 (%d bytes, %d 联系人, vCard %s)",
+                 vlen, pb_count, requested_format == 0x01 ? "3.0" : "2.1");
     } else if (want_listing) {
         char *listing = malloc(1024);
         if (!listing) { obex_send(handle, 0xD3, NULL, 0); return; }
