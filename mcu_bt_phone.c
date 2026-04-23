@@ -114,21 +114,16 @@ static const contact_t phonebook[] = {
 enum { CALLLOG_MAX = 32 };
 
 static calllog_t incoming_calls[CALLLOG_MAX] = {
-    {"张三", "13800138000", "20260423T083015"},
-    {"未知来电", "13912345678", "20260422T214500"},
 };
-static size_t incoming_call_count = 2;
+static size_t incoming_call_count = 0;
 
 static calllog_t outgoing_calls[CALLLOG_MAX] = {
-    {"李四", "13501693774", "20260423T091230"},
-    {"王五", "13600136000", "20260422T182000"},
 };
-static size_t outgoing_call_count = 2;
+static size_t outgoing_call_count = 0;
 
 static calllog_t missed_calls[CALLLOG_MAX] = {
-    {"赵六", "13700137000", "20260423T072010"},
 };
-static size_t missed_call_count = 1;
+static size_t missed_call_count = 0;
 
 static void pbap_get_datetime(char *out, size_t len)
 {
@@ -136,10 +131,10 @@ static void pbap_get_datetime(char *out, size_t len)
     struct tm tm_buf;
     struct tm *ptm = gmtime_r(&now, &tm_buf);
     if (ptm == NULL) {
-        strlcpy(out, "19700101T000000", len);
+        strlcpy(out, "19700101T000000Z", len);
         return;
     }
-    strftime(out, len, "%Y%m%dT%H%M%S", ptm);
+    strftime(out, len, "%Y%m%dT%H%M%SZ", ptm);
 }
 
 static void pbap_append_calllog(calllog_t *logs, size_t *count,
@@ -1115,7 +1110,8 @@ static int build_phonebook_vcards(char *buf, int max_len, uint8_t format)
 }
 
 static int build_calllog_vcards(char *buf, int max_len, uint8_t format,
-                                const calllog_t *logs, size_t log_count)
+                                const calllog_t *logs, size_t log_count,
+                                const char *call_type)
 {
     int off = 0;
     bool use_vcard30 = (format == 0x01);
@@ -1128,9 +1124,9 @@ static int build_calllog_vcards(char *buf, int max_len, uint8_t format,
                 "N:%s;;;;\r\n"
                 "FN:%s\r\n"
                 "TEL;TYPE=CELL:%s\r\n"
-                "X-IRMC-CALL-DATETIME:%s\r\n"
+                "X-IRMC-CALL-DATETIME;TYPE=%s:%s\r\n"
                 "END:VCARD\r\n",
-                logs[i].name, logs[i].name, logs[i].number, logs[i].datetime);
+                logs[i].name, logs[i].name, logs[i].number, call_type, logs[i].datetime);
         } else {
             n = snprintf(buf + off, max_len - off,
                 "BEGIN:VCARD\r\n"
@@ -1138,9 +1134,9 @@ static int build_calllog_vcards(char *buf, int max_len, uint8_t format,
                 "N;CHARSET=UTF-8:%s;;;;\r\n"
                 "FN;CHARSET=UTF-8:%s\r\n"
                 "TEL;TYPE=CELL:%s\r\n"
-                "X-IRMC-CALL-DATETIME:%s\r\n"
+                "X-IRMC-CALL-DATETIME;TYPE=%s:%s\r\n"
                 "END:VCARD\r\n",
-                logs[i].name, logs[i].name, logs[i].number, logs[i].datetime);
+                logs[i].name, logs[i].name, logs[i].number, call_type, logs[i].datetime);
         }
         if (n < 0 || off + n >= max_len) break;
         off += n;
@@ -1356,21 +1352,25 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
     const calllog_t *selected_logs = NULL;
     size_t selected_log_count = 0;
     const char *obj_label = "pb";
+    const char *selected_call_type = "DIALED";
     switch (requested_obj) {
         case PB_OBJ_ICH:
             selected_logs = incoming_calls;
             selected_log_count = incoming_call_count;
             obj_label = "ich";
+            selected_call_type = "RECEIVED";
             break;
         case PB_OBJ_OCH:
             selected_logs = outgoing_calls;
             selected_log_count = outgoing_call_count;
             obj_label = "och";
+            selected_call_type = "DIALED";
             break;
         case PB_OBJ_MCH:
             selected_logs = missed_calls;
             selected_log_count = missed_call_count;
             obj_label = "mch";
+            selected_call_type = "MISSED";
             break;
         case PB_OBJ_CCH:
             obj_label = "cch";
@@ -1410,14 +1410,15 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
         } else if (requested_obj == PB_OBJ_CCH) {
             int off = 0;
             off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
-                                        incoming_calls, incoming_call_count);
+                                        incoming_calls, incoming_call_count, "RECEIVED");
             off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
-                                        outgoing_calls, outgoing_call_count);
+                                        outgoing_calls, outgoing_call_count, "DIALED");
             off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
-                                        missed_calls, missed_call_count);
+                                        missed_calls, missed_call_count, "MISSED");
             vlen = off;
         } else {
-            vlen = build_calllog_vcards(vcards, 2048, requested_format, selected_logs, selected_log_count);
+            vlen = build_calllog_vcards(vcards, 2048, requested_format,
+                                        selected_logs, selected_log_count, selected_call_type);
         }
 
         // 构建响应：Type + App Params + End-of-Body（部分车机需要 Type 才会入库）
