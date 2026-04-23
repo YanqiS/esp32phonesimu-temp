@@ -493,6 +493,8 @@ static esp_err_t wifi_init_sta_ap(void)
         ESP_LOGW(TAG, "⚠️ 你还没改 WIFI_STA_SSID/WIFI_STA_PASS，当前一定会连不上");
     }
     ESP_ERROR_CHECK(esp_wifi_start());
+    // 关闭省电，优先保证首次连网稳定性和流媒体实时性（音乐App更敏感）
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     ESP_LOGI(TAG, "📶 Wi-Fi AP+STA 已启动");
     ESP_LOGI(TAG, "📶 STA 连接: ssid=%s", WIFI_STA_SSID);
