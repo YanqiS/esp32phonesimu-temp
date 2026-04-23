@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -98,9 +99,9 @@ typedef struct
 
 typedef struct
 {
-    const char *name;
-    const char *number;
-    const char *datetime; // UTC格式: YYYYMMDDTHHMMSS
+    char name[32];
+    char number[32];
+    char datetime[20]; // UTC格式: YYYYMMDDTHHMMSS
 } calllog_t;
 
 static const contact_t phonebook[] = {
@@ -110,19 +111,56 @@ static const contact_t phonebook[] = {
     {"赵六", "13700137000"},
 };
 
-static const calllog_t incoming_calls[] = {
+enum { CALLLOG_MAX = 32 };
+
+static calllog_t incoming_calls[CALLLOG_MAX] = {
     {"张三", "13800138000", "20260423T083015"},
     {"未知来电", "13912345678", "20260422T214500"},
 };
+static size_t incoming_call_count = 2;
 
-static const calllog_t outgoing_calls[] = {
+static calllog_t outgoing_calls[CALLLOG_MAX] = {
     {"李四", "13501693774", "20260423T091230"},
     {"王五", "13600136000", "20260422T182000"},
 };
+static size_t outgoing_call_count = 2;
 
-static const calllog_t missed_calls[] = {
+static calllog_t missed_calls[CALLLOG_MAX] = {
     {"赵六", "13700137000", "20260423T072010"},
 };
+static size_t missed_call_count = 1;
+
+static void pbap_get_datetime(char *out, size_t len)
+{
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    struct tm *ptm = gmtime_r(&now, &tm_buf);
+    if (ptm == NULL) {
+        strlcpy(out, "19700101T000000", len);
+        return;
+    }
+    strftime(out, len, "%Y%m%dT%H%M%S", ptm);
+}
+
+static void pbap_append_calllog(calllog_t *logs, size_t *count,
+                                const char *name, const char *number)
+{
+    if (!logs || !count || !number || number[0] == '\0') return;
+    size_t idx = *count;
+    if (idx >= CALLLOG_MAX) {
+        memmove(&logs[0], &logs[1], sizeof(calllog_t) * (CALLLOG_MAX - 1));
+        idx = CALLLOG_MAX - 1;
+        *count = CALLLOG_MAX;
+    } else {
+        *count = idx + 1;
+    }
+
+    calllog_t *it = &logs[idx];
+    memset(it, 0, sizeof(*it));
+    strlcpy(it->name, (name && name[0]) ? name : "未知号码", sizeof(it->name));
+    strlcpy(it->number, number, sizeof(it->number));
+    pbap_get_datetime(it->datetime, sizeof(it->datetime));
+}
 
 static const char *lookup_contact_name(const char *number)
 {
@@ -618,6 +656,9 @@ void handle_call_reject(void)
     ESP_LOGI(TAG, "❌ 电话号码: %s", current_phone_number);
     ESP_LOGI(TAG, "❌ ===============================");
 
+    const char *name = lookup_contact_name(current_phone_number);
+    pbap_append_calllog(missed_calls, &missed_call_count, name, current_phone_number);
+
     // // 停止RING
     // if (ring_timer != NULL)
     // {
@@ -664,6 +705,13 @@ void handle_call_hangup(void)
         ESP_LOGI(TAG, "📴 联系人: %s", name);
     }
     ESP_LOGI(TAG, "📴 ===============================");
+
+    // 通话结束后写入通话记录：来电通话→ICH，外拨通话→OCH
+    if (current_call_direction == CALL_DIR_INCOMING) {
+        pbap_append_calllog(incoming_calls, &incoming_call_count, name, current_phone_number);
+    } else {
+        pbap_append_calllog(outgoing_calls, &outgoing_call_count, name, current_phone_number);
+    }
 
     current_call_state = CALL_STATE_IDLE;
     led_mode = 2; // 绿灯常亮
@@ -823,6 +871,8 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         else if (current_call_state == CALL_STATE_DIALING ||
                  current_call_state == CALL_STATE_ALERTING)
         {
+            const char *name = lookup_contact_name(current_phone_number);
+            pbap_append_calllog(outgoing_calls, &outgoing_call_count, name, current_phone_number);
             current_call_state = CALL_STATE_IDLE;
             led_mode = 2;
             esp_hf_ag_end_call(connected_device, 0, 0,
@@ -1309,17 +1359,17 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
     switch (requested_obj) {
         case PB_OBJ_ICH:
             selected_logs = incoming_calls;
-            selected_log_count = sizeof(incoming_calls) / sizeof(incoming_calls[0]);
+            selected_log_count = incoming_call_count;
             obj_label = "ich";
             break;
         case PB_OBJ_OCH:
             selected_logs = outgoing_calls;
-            selected_log_count = sizeof(outgoing_calls) / sizeof(outgoing_calls[0]);
+            selected_log_count = outgoing_call_count;
             obj_label = "och";
             break;
         case PB_OBJ_MCH:
             selected_logs = missed_calls;
-            selected_log_count = sizeof(missed_calls) / sizeof(missed_calls[0]);
+            selected_log_count = missed_call_count;
             obj_label = "mch";
             break;
         case PB_OBJ_CCH:
@@ -1335,9 +1385,7 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
     if (requested_obj == PB_OBJ_PHONEBOOK) {
         pb_count = (uint16_t)(sizeof(phonebook) / sizeof(phonebook[0]));
     } else if (requested_obj == PB_OBJ_CCH) {
-        pb_count = (uint16_t)((sizeof(incoming_calls) / sizeof(incoming_calls[0])) +
-                              (sizeof(outgoing_calls) / sizeof(outgoing_calls[0])) +
-                              (sizeof(missed_calls) / sizeof(missed_calls[0])));
+        pb_count = (uint16_t)(incoming_call_count + outgoing_call_count + missed_call_count);
     } else {
         pb_count = (uint16_t)selected_log_count;
     }
@@ -1362,11 +1410,11 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
         } else if (requested_obj == PB_OBJ_CCH) {
             int off = 0;
             off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
-                                        incoming_calls, sizeof(incoming_calls) / sizeof(incoming_calls[0]));
+                                        incoming_calls, incoming_call_count);
             off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
-                                        outgoing_calls, sizeof(outgoing_calls) / sizeof(outgoing_calls[0]));
+                                        outgoing_calls, outgoing_call_count);
             off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
-                                        missed_calls, sizeof(missed_calls) / sizeof(missed_calls[0]));
+                                        missed_calls, missed_call_count);
             vlen = off;
         } else {
             vlen = build_calllog_vcards(vcards, 2048, requested_format, selected_logs, selected_log_count);
