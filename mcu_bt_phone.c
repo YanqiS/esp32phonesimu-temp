@@ -96,11 +96,32 @@ typedef struct
     const char *number;
 } contact_t;
 
+typedef struct
+{
+    const char *name;
+    const char *number;
+    const char *datetime; // UTC格式: YYYYMMDDTHHMMSS
+} calllog_t;
+
 static const contact_t phonebook[] = {
     {"张三", "13800138000"},
     {"李四", "13501693774"},
     {"王五", "13600136000"},
     {"赵六", "13700137000"},
+};
+
+static const calllog_t incoming_calls[] = {
+    {"张三", "13800138000", "20260423T083015"},
+    {"未知来电", "13912345678", "20260422T214500"},
+};
+
+static const calllog_t outgoing_calls[] = {
+    {"李四", "13501693774", "20260423T091230"},
+    {"王五", "13600136000", "20260422T182000"},
+};
+
+static const calllog_t missed_calls[] = {
+    {"赵六", "13700137000", "20260423T072010"},
 };
 
 static const char *lookup_contact_name(const char *number)
@@ -1043,6 +1064,65 @@ static int build_phonebook_vcards(char *buf, int max_len, uint8_t format)
     return off;
 }
 
+static int build_calllog_vcards(char *buf, int max_len, uint8_t format,
+                                const calllog_t *logs, size_t log_count)
+{
+    int off = 0;
+    bool use_vcard30 = (format == 0x01);
+    for (size_t i = 0; i < log_count; i++) {
+        int n = 0;
+        if (use_vcard30) {
+            n = snprintf(buf + off, max_len - off,
+                "BEGIN:VCARD\r\n"
+                "VERSION:3.0\r\n"
+                "N:%s;;;;\r\n"
+                "FN:%s\r\n"
+                "TEL;TYPE=CELL:%s\r\n"
+                "X-IRMC-CALL-DATETIME:%s\r\n"
+                "END:VCARD\r\n",
+                logs[i].name, logs[i].name, logs[i].number, logs[i].datetime);
+        } else {
+            n = snprintf(buf + off, max_len - off,
+                "BEGIN:VCARD\r\n"
+                "VERSION:2.1\r\n"
+                "N;CHARSET=UTF-8:%s;;;;\r\n"
+                "FN;CHARSET=UTF-8:%s\r\n"
+                "TEL;TYPE=CELL:%s\r\n"
+                "X-IRMC-CALL-DATETIME:%s\r\n"
+                "END:VCARD\r\n",
+                logs[i].name, logs[i].name, logs[i].number, logs[i].datetime);
+        }
+        if (n < 0 || off + n >= max_len) break;
+        off += n;
+    }
+    return off;
+}
+
+typedef enum {
+    PB_OBJ_PHONEBOOK = 0,
+    PB_OBJ_ICH,
+    PB_OBJ_OCH,
+    PB_OBJ_MCH,
+    PB_OBJ_CCH,
+} pb_object_t;
+
+static bool utf16be_contains_ascii(const uint8_t *buf, uint16_t start, uint16_t end, const char *token)
+{
+    size_t tlen = strlen(token);
+    if (tlen == 0) return false;
+    for (uint16_t k = start; (uint32_t)k + (uint32_t)(tlen * 2) <= end; k += 2) {
+        bool match = true;
+        for (size_t i = 0; i < tlen; i++) {
+            if (buf[k + i * 2] != 0 || buf[k + i * 2 + 1] != (uint8_t)token[i]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 // 生成 vCard-listing XML（车机浏览联系人列表时请求）
 static int build_vcard_listing(char *buf, int max_len)
 {
@@ -1162,6 +1242,7 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
     uint16_t max_list_count = 0xFFFF;  // 默认：全部下载
     bool has_max_list_count = false;
     uint8_t requested_format = 0x00;
+    pb_object_t requested_obj = PB_OBJ_PHONEBOOK;
 
     // ===== 解析所有 OBEX headers =====
     while (pos + 1 <= len) {
@@ -1181,12 +1262,15 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
                 if (strstr(t, "x-bt/vcard"))         want_phonebook = true;
             }
             else if (hid == 0x01) {  // Name header (UTF-16BE)
-                for (uint16_t k = pos + 3; k + 3 < pos + hlen; k += 2) {
-                    if (data[k]==0 && data[k+1]=='p' && data[k+2]==0 && data[k+3]=='b') {
-                        want_phonebook = true;
-                        break;
-                    }
-                }
+                uint16_t nstart = pos + 3;
+                uint16_t nend = pos + hlen;
+                if (utf16be_contains_ascii(data, nstart, nend, "ich")) requested_obj = PB_OBJ_ICH;
+                else if (utf16be_contains_ascii(data, nstart, nend, "och")) requested_obj = PB_OBJ_OCH;
+                else if (utf16be_contains_ascii(data, nstart, nend, "mch")) requested_obj = PB_OBJ_MCH;
+                else if (utf16be_contains_ascii(data, nstart, nend, "cch")) requested_obj = PB_OBJ_CCH;
+                else if (utf16be_contains_ascii(data, nstart, nend, "pb"))  requested_obj = PB_OBJ_PHONEBOOK;
+
+                want_phonebook = true;
             }
             else if (hid == 0x4C) {  // Application Parameters
                 // 解析 tag-length-value
@@ -1219,7 +1303,45 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
         want_phonebook = true;
     }
 
-    uint16_t pb_count = (uint16_t)(sizeof(phonebook) / sizeof(phonebook[0]));
+    const calllog_t *selected_logs = NULL;
+    size_t selected_log_count = 0;
+    const char *obj_label = "pb";
+    switch (requested_obj) {
+        case PB_OBJ_ICH:
+            selected_logs = incoming_calls;
+            selected_log_count = sizeof(incoming_calls) / sizeof(incoming_calls[0]);
+            obj_label = "ich";
+            break;
+        case PB_OBJ_OCH:
+            selected_logs = outgoing_calls;
+            selected_log_count = sizeof(outgoing_calls) / sizeof(outgoing_calls[0]);
+            obj_label = "och";
+            break;
+        case PB_OBJ_MCH:
+            selected_logs = missed_calls;
+            selected_log_count = sizeof(missed_calls) / sizeof(missed_calls[0]);
+            obj_label = "mch";
+            break;
+        case PB_OBJ_CCH:
+            obj_label = "cch";
+            break;
+        case PB_OBJ_PHONEBOOK:
+        default:
+            obj_label = "pb";
+            break;
+    }
+
+    uint16_t pb_count = 0;
+    if (requested_obj == PB_OBJ_PHONEBOOK) {
+        pb_count = (uint16_t)(sizeof(phonebook) / sizeof(phonebook[0]));
+    } else if (requested_obj == PB_OBJ_CCH) {
+        pb_count = (uint16_t)((sizeof(incoming_calls) / sizeof(incoming_calls[0])) +
+                              (sizeof(outgoing_calls) / sizeof(outgoing_calls[0])) +
+                              (sizeof(missed_calls) / sizeof(missed_calls[0])));
+    } else {
+        pb_count = (uint16_t)selected_log_count;
+    }
+    ESP_LOGI(TAG, "📒 PBAP 请求对象: %s", obj_label);
 
     // ===== MaxListCount == 0：车机只想知道有多少条，不要数据 =====
     if (has_max_list_count && max_list_count == 0) {
@@ -1234,7 +1356,21 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
     if (want_phonebook) {
         char *vcards = malloc(2048);
         if (!vcards) { obex_send(handle, 0xD3, NULL, 0); return; }
-        int vlen = build_phonebook_vcards(vcards, 2048, requested_format);
+        int vlen = 0;
+        if (requested_obj == PB_OBJ_PHONEBOOK) {
+            vlen = build_phonebook_vcards(vcards, 2048, requested_format);
+        } else if (requested_obj == PB_OBJ_CCH) {
+            int off = 0;
+            off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
+                                        incoming_calls, sizeof(incoming_calls) / sizeof(incoming_calls[0]));
+            off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
+                                        outgoing_calls, sizeof(outgoing_calls) / sizeof(outgoing_calls[0]));
+            off += build_calllog_vcards(vcards + off, 2048 - off, requested_format,
+                                        missed_calls, sizeof(missed_calls) / sizeof(missed_calls[0]));
+            vlen = off;
+        } else {
+            vlen = build_calllog_vcards(vcards, 2048, requested_format, selected_logs, selected_log_count);
+        }
 
         // 构建响应：Type + App Params + End-of-Body（部分车机需要 Type 才会入库）
         const char *mime = (requested_format == 0x01) ? "x-bt/phonebook;version=3.0" : "x-bt/phonebook;version=2.1";
@@ -1261,8 +1397,8 @@ static void obex_handle_get(uint32_t handle, const uint8_t *data, uint16_t len)
         obex_send(handle, 0xA0, payload, p);
         free(payload);
         free(vcards);
-        ESP_LOGI(TAG, "📒 PBAP 发送通讯录 (%d bytes, %d 联系人, vCard %s)",
-                 vlen, pb_count, requested_format == 0x01 ? "3.0" : "2.1");
+        ESP_LOGI(TAG, "📒 PBAP 发送对象=%s (%d bytes, %d 条, vCard %s)",
+                 obj_label, vlen, pb_count, requested_format == 0x01 ? "3.0" : "2.1");
     } else if (want_listing) {
         char *listing = malloc(1024);
         if (!listing) { obex_send(handle, 0xD3, NULL, 0); return; }
