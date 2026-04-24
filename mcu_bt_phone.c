@@ -41,6 +41,7 @@
 #define WIFI_AP_CHANNEL    6
 #define WIFI_MAX_STA_CONN  4
 #define WIFI_COUNTRY_CODE  "CN"
+#define LOCAL_TIMEZONE     "CST-8" // UTC+8
 // 关闭可显著降低蓝牙内存占用，减少 RFCOMM malloc failed 风险
 #define ENABLE_MEDIA_PROFILES 0
 
@@ -153,7 +154,7 @@ static void pbap_get_datetime(char *out, size_t len)
         now = pseudo_now++;
     }
     struct tm tm_buf;
-    struct tm *ptm = gmtime_r(&now, &tm_buf);
+    struct tm *ptm = localtime_r(&now, &tm_buf);
     if (ptm == NULL) {
         strlcpy(out, "20260101T000000", len);
         return;
@@ -2200,6 +2201,10 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    setenv("TZ", LOCAL_TIMEZONE, 1);
+    tzset();
+    ESP_LOGI(TAG, "🕒 本地时区已设置: %s", LOCAL_TIMEZONE);
 
     esp_err_t ret_wifi = wifi_init_sta_ap();
     if (ret_wifi != ESP_OK)
