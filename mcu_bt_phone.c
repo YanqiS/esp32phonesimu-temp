@@ -12,6 +12,7 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_sntp.h"
+#include "esp_coexist.h"
 #include "lwip/inet.h"
 
 // Classic Bluetooth
@@ -558,6 +559,10 @@ static esp_err_t wifi_init_sta_ap(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     // 关闭省电，优先保证首次连网稳定性和流媒体实时性（音乐App更敏感）
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+#if CONFIG_ESP_COEX_SW_COEXIST_ENABLE
+    // 开启 A2DP 时优先保证 Wi-Fi 数据通路，避免车机判定“无网络”
+    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+#endif
 
     ESP_LOGI(TAG, "📶 Wi-Fi AP+STA 已启动");
     ESP_LOGI(TAG, "📶 STA 连接: ssid=%s", WIFI_STA_SSID);
