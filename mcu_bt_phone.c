@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <stdlib.h>
 #include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -77,6 +78,7 @@ static int led_mode = 0;
 static bool a2dp_connected = false;
 static bool avrcp_connected = false;
 static int negotiated_hfp_codec = -1;
+static bool timezone_inited = false;
 
 // HFP连接状态
 static bool hfp_connected = false;
@@ -116,7 +118,7 @@ typedef struct
 {
     char name[32];
     char number[32];
-    char datetime[20]; // UTC格式: YYYYMMDDTHHMMSS
+    char datetime[20]; // 本地时间格式: YYYYMMDDTHHMMSS
 } calllog_t;
 
 static const contact_t phonebook[] = {
@@ -150,7 +152,7 @@ static void pbap_get_datetime(char *out, size_t len)
         now = pseudo_now++;
     }
     struct tm tm_buf;
-    struct tm *ptm = gmtime_r(&now, &tm_buf);
+    struct tm *ptm = localtime_r(&now, &tm_buf);
     if (ptm == NULL) {
         strlcpy(out, "20260101T000000", len);
         return;
@@ -406,6 +408,14 @@ static esp_err_t start_bt_phone(void)
 
 static void start_sntp_if_needed(void)
 {
+    if (!timezone_inited) {
+        // 使用东八区本地时间，避免 PBAP 通话记录显示为 UTC 小时
+        setenv("TZ", "CST-8", 1);
+        tzset();
+        timezone_inited = true;
+        ESP_LOGI(TAG, "🕒 已设置本地时区: CST-8");
+    }
+
     if (sntp_started) return;
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
