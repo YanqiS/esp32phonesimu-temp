@@ -458,6 +458,7 @@ static void configure_ap_dns_from_sta(void)
     if (stop_ret != ESP_OK && stop_ret != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
         ESP_LOGW(TAG, "⚠️ 停止 AP DHCP Server 失败: %s", esp_err_to_name(stop_ret));
     }
+#if defined(OFFER_DNS)
     dhcps_offer_t dhcps_dns_offer = OFFER_DNS;
     esp_err_t opt_ret = esp_netif_dhcps_option(wifi_ap_netif, ESP_NETIF_OP_SET,
                                                ESP_NETIF_DOMAIN_NAME_SERVER,
@@ -468,6 +469,9 @@ static void configure_ap_dns_from_sta(void)
         esp_ip4_addr_t offer_dns_ip = {.addr = offer_dns_addr};
         ESP_LOGI(TAG, "📶 DHCP DNS Option 已设置: " IPSTR, IP2STR(&offer_dns_ip));
     }
+#else
+    ESP_LOGW(TAG, "⚠️ 当前 IDF 未暴露 OFFER_DNS，跳过 DHCP Option 6 显式设置");
+#endif
     esp_err_t start_ret = esp_netif_dhcps_start(wifi_ap_netif);
     if (start_ret != ESP_OK && start_ret != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
         ESP_LOGW(TAG, "⚠️ 启动 AP DHCP Server 失败: %s", esp_err_to_name(start_ret));
@@ -561,6 +565,7 @@ static esp_err_t wifi_init_sta_ap(void)
     return ESP_OK;
 }
 
+#if ENABLE_MEDIA_PROFILES
 static void a2dp_source_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
     switch (event)
@@ -594,6 +599,7 @@ static void avrc_tg_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_
         break;
     }
 }
+#endif
 
 /* ===================== LED控制 ===================== */
 
